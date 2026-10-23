@@ -23,7 +23,7 @@ No Isaac Sim installation is required for the chosen Newton backend and Viser di
 First check both physical scenes, filtered ball/head contacts, finite stepping, and missed-ball reset:
 
 ```bash
-uv run python -m pytest source/isaaclab_tasks/test/test_microduck_ball.py -q
+uv run --extra test python -m pytest source/isaaclab_tasks/test/test_microduck_ball.py -q
 ```
 
 The startup report prints which bodies count as the head. The test drops a ball onto those bodies;
@@ -130,7 +130,7 @@ checkpoints, `--no-resume_optimizer_state` is required. The CPU regression tests
 the real RSL-RL models and check inference preservation and that new connections can learn:
 
 ```bash
-uv run python -m pytest scripts/tools/test/test_prepare_microduck_ball_checkpoint.py -q
+uv run --extra test python -m pytest scripts/tools/test/test_prepare_microduck_ball_checkpoint.py -q
 ```
 
 For small steps of difficulty, increase `env.serve_spread` from `0.01` only after successful convenient

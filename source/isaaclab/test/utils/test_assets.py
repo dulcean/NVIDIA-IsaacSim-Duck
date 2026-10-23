@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import builtins
 import importlib
 import json
 import logging
@@ -21,6 +22,33 @@ import pytest
 import isaaclab.utils.assets as assets_utils
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.parametrize("override", [None, "https://example.com/custom-assets"])
+def test_asset_module_import_without_kit_experience(monkeypatch, override):
+    """A kitless import resolves usable asset URLs, including an explicit root override."""
+    original_open = builtins.open
+    experience_path = assets_utils._KIT_EXPERIENCE_PATH
+
+    def open_without_experience(file, *args, **kwargs):
+        if file == experience_path:
+            raise FileNotFoundError(experience_path)
+        return original_open(file, *args, **kwargs)
+
+    try:
+        with monkeypatch.context() as patched:
+            patched.delenv("ISAACSIM_ASSET_REGION_PROFILE", raising=False)
+            if override is None:
+                patched.delenv("ISAACSIM_ASSET_ROOT", raising=False)
+            else:
+                patched.setenv("ISAACSIM_ASSET_ROOT", override)
+            patched.setattr(builtins, "open", open_without_experience)
+            module = importlib.reload(assets_utils)
+            expected = override or "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/6.2"
+            assert expected == module.NUCLEUS_ASSET_ROOT_DIR
+            assert f"{expected}/Isaac/IsaacLab" == module.ISAACLAB_NUCLEUS_DIR
+    finally:
+        importlib.reload(assets_utils)
 
 
 def test_asset_root_environment_override_takes_precedence(monkeypatch):
