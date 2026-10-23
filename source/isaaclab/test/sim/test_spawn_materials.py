@@ -1,0 +1,116 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+from isaaclab.test.utils import launch_test_simulation
+
+launch_test_simulation()
+
+import pytest
+
+from pxr import UsdPhysics, UsdShade
+
+import isaaclab.sim as sim_utils
+from isaaclab.sim import SimulationCfg, SimulationContext
+
+pytestmark = [pytest.mark.integration, pytest.mark.isaacsim_ci]
+
+
+@pytest.fixture
+def sim():
+    """Create a simulation context."""
+    sim_utils.create_new_stage()
+    dt = 0.1
+    sim = SimulationContext(SimulationCfg(dt=dt))
+    yield sim
+    sim.stop()
+    sim.clear_instance()
+
+
+def test_spawn_glass_mdl_material(sim):
+    """Test spawning a glass mdl material."""
+    cfg = sim_utils.GlassMdlCfg(thin_walled=False, glass_ior=1.0, glass_color=(0.0, 1.0, 0.0))
+    prim = cfg.func("/Looks/GlassMaterial", cfg)
+    # Check validity
+    assert prim.IsValid()
+    assert sim.stage.GetPrimAtPath("/Looks/GlassMaterial").IsValid()
+    assert prim.GetPrimTypeInfo().GetTypeName() == "Shader"
+    # Check properties
+    assert prim.GetAttribute("inputs:thin_walled").Get() == cfg.thin_walled
+    assert prim.GetAttribute("inputs:glass_ior").Get() == cfg.glass_ior
+    assert prim.GetAttribute("inputs:glass_color").Get() == cfg.glass_color
+
+
+def test_spawn_rigid_body_material(sim):
+    """Test spawning a rigid body material."""
+    cfg = sim_utils.PhysxRigidBodyMaterialCfg(
+        dynamic_friction=1.5,
+        restitution=1.5,
+        static_friction=0.5,
+        restitution_combine_mode="max",
+        friction_combine_mode="max",
+    )
+    prim = cfg.func("/Looks/RigidBodyMaterial", cfg)
+    # Check validity
+    assert prim.IsValid()
+    assert sim.stage.GetPrimAtPath("/Looks/RigidBodyMaterial").IsValid()
+    # Check properties
+    assert prim.GetAttribute("physics:staticFriction").Get() == cfg.static_friction
+    assert prim.GetAttribute("physics:dynamicFriction").Get() == cfg.dynamic_friction
+    assert prim.GetAttribute("physics:restitution").Get() == cfg.restitution
+    assert prim.GetAttribute("physxMaterial:restitutionCombineMode").Get() == cfg.restitution_combine_mode
+    assert prim.GetAttribute("physxMaterial:frictionCombineMode").Get() == cfg.friction_combine_mode
+
+
+def test_apply_rigid_body_material_on_visual_material(sim):
+    """Test applying a rigid body material on a visual material."""
+    cfg = sim_utils.GlassMdlCfg(thin_walled=False, glass_ior=1.0, glass_color=(0.0, 1.0, 0.0))
+    prim = cfg.func("/Looks/Material", cfg)
+    cfg = sim_utils.PhysxRigidBodyMaterialCfg(
+        dynamic_friction=1.5,
+        restitution=1.5,
+        static_friction=0.5,
+        restitution_combine_mode="max",
+        friction_combine_mode="max",
+    )
+    prim = cfg.func("/Looks/Material", cfg)
+    # Check validity
+    assert prim.IsValid()
+    assert sim.stage.GetPrimAtPath("/Looks/Material").IsValid()
+    # Check properties
+    assert prim.GetAttribute("physics:staticFriction").Get() == cfg.static_friction
+    assert prim.GetAttribute("physics:dynamicFriction").Get() == cfg.dynamic_friction
+    assert prim.GetAttribute("physics:restitution").Get() == cfg.restitution
+    assert prim.GetAttribute("physxMaterial:restitutionCombineMode").Get() == cfg.restitution_combine_mode
+    assert prim.GetAttribute("physxMaterial:frictionCombineMode").Get() == cfg.friction_combine_mode
+
+
+def test_bind_prim_to_material(sim):
+    """Test binding a rigid body material on a mesh prim."""
+
+    # create a mesh prim
+    object_prim = sim_utils.create_prim("/World/Geometry/box", "Cube")
+    UsdPhysics.CollisionAPI.Apply(object_prim)
+
+    # create a visual material
+    visual_material_cfg = sim_utils.GlassMdlCfg(glass_ior=1.0, thin_walled=True)
+    visual_material_cfg.func("/World/Looks/glassMaterial", visual_material_cfg)
+    # create a physics material
+    physics_material_cfg = sim_utils.RigidBodyMaterialBaseCfg(
+        static_friction=0.5, dynamic_friction=1.5, restitution=1.5
+    )
+    physics_material_cfg.func("/World/Physics/rubberMaterial", physics_material_cfg)
+    sim_utils.bind_visual_material("/World/Geometry/box", "/World/Looks/glassMaterial")
+    sim_utils.bind_physics_material("/World/Geometry/box", "/World/Physics/rubberMaterial")
+
+    # check the material binding
+    material_binding_api = UsdShade.MaterialBindingAPI(object_prim)
+    # -- visual material
+    material_direct_binding = material_binding_api.GetDirectBinding()
+    assert material_direct_binding.GetMaterialPath() == "/World/Looks/glassMaterial"
+    assert material_direct_binding.GetMaterialPurpose() == ""
+    # -- physics material
+    material_direct_binding = material_binding_api.GetDirectBinding("physics")
+    assert material_direct_binding.GetMaterialPath() == "/World/Physics/rubberMaterial"
+    assert material_direct_binding.GetMaterialPurpose() == "physics"

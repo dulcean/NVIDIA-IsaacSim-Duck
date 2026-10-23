@@ -1,0 +1,349 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Tests for the renderer→camera output contract."""
+
+import warnings
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import warp as wp
+
+pytest.importorskip("isaaclab_physx")
+
+import isaaclab.sim as sim_utils
+from isaaclab.assets import RigidObjectCfg
+from isaaclab.renderers import BaseRenderer
+from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
+from isaaclab.sensors.camera import CameraCfg, CameraISPMode, TiledCameraCfg
+from isaaclab.sensors.camera.camera_data import CameraData, RenderBufferKind, RenderBufferSpec
+from isaaclab.sim import PinholeCameraCfg
+from isaaclab.test.utils import DeviceScope, test_devices
+from isaaclab.utils import clone, instantiate, replace, validate
+
+pytestmark = [pytest.mark.integration, pytest.mark.rendering]
+
+_SPAWN = PinholeCameraCfg(
+    focal_length=24.0,
+    focus_distance=400.0,
+    horizontal_aperture=20.955,
+    clipping_range=(0.1, 1.0e5),
+)
+
+
+def test_camera_isp_is_resolved_during_construction():
+    """Authored and explicit ISP configurations are ready before physics or renderer initialization."""
+    pytest.importorskip("isaaclab_newton")
+    pytest.importorskip("newton")
+    from isaaclab_newton.physics import NewtonCfg
+    from isaaclab_newton.renderers import NewtonWarpRendererCfg
+    from isaaclab_ppisp import PpispCfg
+
+    from pxr import Sdf, UsdGeom
+
+    sim_cfg = sim_utils.SimulationCfg(device="cpu", physics=NewtonCfg())
+    with sim_utils.build_simulation_context(sim_cfg=sim_cfg) as sim:
+        prim = UsdGeom.Camera.Define(sim.stage, "/World/AuthoredCamera").GetPrim()
+        prim.CreateAttribute("ppisp:responsivity", Sdf.ValueTypeNames.Float).Set(3.0)
+        prim.CreateAttribute("exposure", Sdf.ValueTypeNames.Float).Set(2.0)
+        cfg = CameraCfg(
+            prim_path="/World/AuthoredCamera", width=16, height=16, data_types=["rgb"],
+            spawn=None, isp_cfg=CameraISPMode.AUTO_CAMERA, renderer_cfg=NewtonWarpRendererCfg(),
+        )  # fmt: skip
+        authored = instantiate(cfg)
+        spawned = instantiate(replace(
+            cfg, prim_path="/World/SpawnedCamera", spawn=_SPAWN, isp_cfg=PpispCfg(inputs={"exposureOffset": 2.0}),
+        ))  # fmt: skip
+        without_isp = instantiate(replace(cfg, prim_path="/World/PlainCamera", spawn=_SPAWN))
+
+        assert isinstance(authored.cfg.isp_cfg, PpispCfg)
+        assert authored.cfg.isp_cfg.inputs["responsivity"] == 3.0
+        assert spawned.cfg.isp_cfg.inputs["exposureOffset"] == 2.0
+        assert spawned.cfg.isp_cfg.inputs["responsivity"] == 1.0
+        assert without_isp.cfg.isp_cfg is None
+        assert cfg.isp_cfg is CameraISPMode.AUTO_CAMERA
+        assert prim.GetAttribute("exposure").Get() == 2.0  # Newton does not use RTX exposure.
+        assert all(not camera.is_initialized for camera in (authored, spawned, without_isp))
+        # Scene authoring belongs to camera construction, without a second renderer lifecycle.
+        assert not hasattr(BaseRenderer, "author_camera")
+        assert not hasattr(BaseRenderer, "prepare_cameras")
+
+
+@pytest.mark.parametrize("background", [None, (0.25, 0.5, 0.75)])
+@pytest.mark.parametrize("device", test_devices(DeviceScope.CUDA))
+def test_newton_hdr_background_preserves_unlit_geometry(background, device):
+    """HDR misses use linear background color while unlit geometry remains black, including graph replay."""
+    pytest.importorskip("isaaclab_newton")
+    pytest.importorskip("newton")
+    from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
+    from isaaclab_newton.renderers import NewtonWarpRendererCfg
+
+    sim_cfg = sim_utils.SimulationCfg(
+        device=device, gravity=(0.0, 0.0, 0.0), physics=NewtonCfg(solver_cfg=MJWarpSolverCfg())
+    )
+    with sim_utils.build_simulation_context(sim_cfg=sim_cfg) as sim:
+        scene_cfg = InteractiveSceneCfg(num_envs=1, env_spacing=2.0)
+        scene_cfg.cube = RigidObjectCfg(
+            prim_path="{ENV_REGEX_NS}/Cube",
+            spawn=sim_utils.CuboidCfg(
+                size=(0.3, 0.3, 0.3),
+                rigid_props=sim_utils.UsdPhysicsRigidBodyCfg(),
+                mass_props=sim_utils.MassCfg(mass=1.0),
+                collision_props=sim_utils.UsdPhysicsCollisionCfg(),
+            ),
+        )
+        scene_cfg.camera = CameraCfg(
+            prim_path="{ENV_REGEX_NS}/Camera",
+            width=32,
+            height=32,
+            data_types=["rgb_hdr"],
+            background_color=background,
+            offset=CameraCfg.OffsetCfg(pos=(0.0, 0.0, 2.0), convention="opengl"),
+            spawn=PinholeCameraCfg(clipping_range=(0.1, 10.0)),
+            renderer_cfg=NewtonWarpRendererCfg(enable_ambient_lighting=False, create_default_light=False),
+        )
+        scene = InteractiveScene(scene_cfg)
+        camera = scene["camera"]
+        sim.reset()
+        expected = (0.0, 0.0, 0.0) if background is None else (0.050876088, 0.21404114, 0.52252155)
+        for _ in range(2):
+            sim.step(render=False)
+            scene.update(sim.get_physics_dt())
+            camera.update(sim.get_physics_dt(), force_recompute=True)
+            pixels = camera.data.output["rgb_hdr"].warp.numpy()[0]
+            np.testing.assert_allclose(pixels[16, 16], 0.0, atol=1e-6)
+            np.testing.assert_allclose(pixels[0, 0], expected, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "field_name,deprecated_value",
+    [
+        ("colorize_semantic_segmentation", False),
+        ("colorize_instance_segmentation", False),
+        ("colorize_instance_id_segmentation", False),
+        ("semantic_filter", ["class"]),
+        ("semantic_segmentation_mapping", {"class:cube": (1, 2, 3, 4)}),
+        ("depth_clipping_behavior", "max"),
+    ],
+)
+def test_camera_cfg_forwards_deprecated_fields_to_renderer_cfg(field_name, deprecated_value):
+    """Deprecated CameraCfg field is forwarded to renderer_cfg with a warning."""
+    kwargs = {
+        "height": 64,
+        "width": 64,
+        "prim_path": "/World/Camera",
+        "spawn": _SPAWN,
+        "data_types": ["rgb"],
+        field_name: deprecated_value,
+    }
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cfg = CameraCfg(**kwargs)
+
+    deprecation_warnings = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+    assert any(f"CameraCfg.{field_name}" in str(w.message) for w in deprecation_warnings)
+    assert getattr(cfg.renderer_cfg, field_name) == deprecated_value
+
+
+def test_camera_cfg_default_does_not_warn_or_forward():
+    """Default-valued deprecated fields stay silent."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cfg = CameraCfg(
+            height=64,
+            width=64,
+            prim_path="/World/Camera",
+            spawn=_SPAWN,
+            data_types=["rgb"],
+        )
+
+    deprecation_warnings = [
+        w for w in caught if issubclass(w.category, DeprecationWarning) and "CameraCfg." in str(w.message)
+    ]
+    assert deprecation_warnings == []
+    assert cfg.renderer_cfg.colorize_semantic_segmentation is True
+
+
+def test_camera_cfg_copy_does_not_reforward_deprecated_fields():
+    """Copying a cfg (as ``SensorBase`` does) keeps a renderer_cfg value set after forwarding."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        cfg = CameraCfg(
+            height=64,
+            width=64,
+            prim_path="/World/Camera",
+            spawn=_SPAWN,
+            data_types=["rgb"],
+            colorize_semantic_segmentation=False,
+        )
+    cfg.renderer_cfg.colorize_semantic_segmentation = True
+
+    assert clone(cfg).renderer_cfg.colorize_semantic_segmentation is True
+
+
+def test_tiled_camera_cfg_does_not_forward_deprecated_fields():
+    """TiledCameraCfg skips CameraCfg's per-field forwarder."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cfg = TiledCameraCfg(
+            height=64,
+            width=64,
+            prim_path="/World/Camera",
+            spawn=_SPAWN,
+            data_types=["rgb"],
+            colorize_semantic_segmentation=False,
+        )
+
+    tiled_warnings = [
+        w for w in caught if issubclass(w.category, DeprecationWarning) and "TiledCameraCfg" in str(w.message)
+    ]
+    assert tiled_warnings
+
+    field_warnings = [
+        w for w in caught if issubclass(w.category, DeprecationWarning) and "CameraCfg.colorize_" in str(w.message)
+    ]
+    assert field_warnings == []
+
+    assert cfg.renderer_cfg.colorize_semantic_segmentation is True
+
+
+def test_newton_warp_supported_output_types_key_set():
+    """Newton renderer and config publish one shared output contract."""
+    pytest.importorskip("isaaclab_newton")
+    pytest.importorskip("newton")
+    from isaaclab_newton.renderers.newton_warp_renderer import NewtonWarpRenderer
+    from isaaclab_newton.renderers.newton_warp_renderer_cfg import NewtonWarpRendererCfg
+
+    renderer = NewtonWarpRenderer.__new__(NewtonWarpRenderer)
+    renderer.cfg = NewtonWarpRendererCfg()
+    specs = renderer.supported_output_types()
+
+    assert specs == renderer.cfg.supported_output_types()
+    assert set(specs.keys()) == {
+        RenderBufferKind.RGB,
+        RenderBufferKind.RGBA,
+        RenderBufferKind.RGB_HDR,
+        RenderBufferKind.ALBEDO,
+        RenderBufferKind.DEPTH,
+        RenderBufferKind.DISTANCE_TO_CAMERA,
+        RenderBufferKind.DISTANCE_TO_IMAGE_PLANE,
+        RenderBufferKind.NORMALS,
+        RenderBufferKind.SEMANTIC_SEGMENTATION,
+        RenderBufferKind.INSTANCE_SEGMENTATION,
+    }
+    assert specs[RenderBufferKind.RGB_HDR] == RenderBufferSpec(3, wp.float32)
+
+
+def test_camera_cfg_rejects_outputs_unsupported_by_renderer():
+    """Camera config validation rejects output types absent from the renderer contract and accepts supported ones."""
+    pytest.importorskip("isaaclab_newton")
+    from isaaclab_newton.renderers import NewtonWarpRendererCfg
+
+    def make_cfg(data_type: str) -> CameraCfg:
+        return CameraCfg(
+            height=64,
+            width=64,
+            prim_path="/World/Camera",
+            spawn=_SPAWN,
+            data_types=[data_type],
+            renderer_cfg=NewtonWarpRendererCfg(),
+        )
+
+    validate(make_cfg("rgb_hdr"))
+    with pytest.raises(ValueError, match="simple_shading_full_mdl"):
+        validate(make_cfg("simple_shading_full_mdl"))
+
+
+@pytest.mark.parametrize("colorize", [True, False])
+def test_newton_warp_segmentation_spec_follows_colorize_flags(colorize):
+    """Segmentation specs are RGBA uint8 when colorized, else single-channel int32 (matching RTX)."""
+    pytest.importorskip("isaaclab_newton")
+    pytest.importorskip("newton")
+    from isaaclab_newton.renderers.newton_warp_renderer import NewtonWarpRenderer
+    from isaaclab_newton.renderers.newton_warp_renderer_cfg import NewtonWarpRendererCfg
+
+    renderer = NewtonWarpRenderer.__new__(NewtonWarpRenderer)
+    renderer.cfg = NewtonWarpRendererCfg(
+        colorize_semantic_segmentation=colorize,
+        colorize_instance_segmentation=colorize,
+    )
+    specs = renderer.supported_output_types()
+
+    expected = RenderBufferSpec(4, wp.uint8) if colorize else RenderBufferSpec(1, wp.int32)
+    for kind in (
+        RenderBufferKind.SEMANTIC_SEGMENTATION,
+        RenderBufferKind.INSTANCE_SEGMENTATION,
+    ):
+        assert specs[kind] == expected
+
+
+def test_newton_warp_wraps_requested_rgb_hdr_output():
+    """NewtonWarpRenderer wires requested RGB_HDR proxies to the Newton HDR output slot."""
+    pytest.importorskip("isaaclab_newton")
+    pytest.importorskip("newton")
+    wp.init()
+    from isaaclab_newton.renderers.newton_warp_renderer import RenderData
+
+    from isaaclab.utils.warp.proxy_array import ProxyArray
+
+    fake_sensor = SimpleNamespace(model=SimpleNamespace(world_count=2, device="cpu"))
+    camera_cfg = CameraCfg(width=4, height=3, prim_path="/World/Camera", spawn=_SPAWN)
+    render_data = RenderData(fake_sensor, SimpleNamespace(cfg=camera_cfg))
+    hdr_proxy = ProxyArray(wp.zeros((2, 3, 4, 3), dtype=wp.float32, device="cpu"))
+
+    render_data.set_outputs({str(RenderBufferKind.RGB_HDR): hdr_proxy})
+
+    assert render_data.outputs.hdr_color_image is not None
+    assert render_data.get_output(RenderBufferKind.RGB_HDR) is render_data.outputs.hdr_color_image
+
+
+def _make_camera_cfg(data_types: list[str]) -> CameraCfg:
+    return CameraCfg(
+        height=8,
+        width=16,
+        prim_path="/World/Camera",
+        spawn=_SPAWN,
+        data_types=data_types,
+    )
+
+
+def test_camera_data_allocates_supported_subset_and_aliases_rgb():
+    """CameraData allocates the intersection of requested + supported and aliases rgb into rgba."""
+    cfg = _make_camera_cfg(["rgb", "rgba", "depth", "instance_segmentation"])
+    specs = {
+        RenderBufferKind.RGBA: RenderBufferSpec(4, wp.uint8),
+        RenderBufferKind.RGB: RenderBufferSpec(3, wp.uint8),
+        RenderBufferKind.DEPTH: RenderBufferSpec(1, wp.float32),
+        RenderBufferKind.NORMALS: RenderBufferSpec(3, wp.float32),
+    }
+    data = CameraData.allocate(
+        data_types=cfg.data_types, height=8, width=16, num_views=2, device="cpu", supported_specs=specs
+    )
+
+    assert set(data.output.keys()) == {"rgba", "rgb", "depth"}
+    assert data.output["rgba"].shape == (2, 8, 16, 4)
+    assert data.output["rgba"].dtype == wp.uint8
+    assert data.output["depth"].shape == (2, 8, 16, 1)
+    assert data.output["depth"].dtype == wp.float32
+    assert data.output["rgb"].warp.ptr == data.output["rgba"].warp.ptr
+    assert data.image_shape == (8, 16)
+    assert data.info == {"rgba": None, "rgb": None, "depth": None}
+
+
+def test_camera_data_allocate_raises_on_unknown_name():
+    """An unknown data_types name raises ValueError naming the offender."""
+    supported_specs = {RenderBufferKind.RGBA: RenderBufferSpec(4, wp.uint8)}
+    with pytest.raises(ValueError) as exc_info:
+        CameraData.allocate(
+            data_types=["not_a_real_type"],
+            height=4,
+            width=4,
+            num_views=1,
+            device="cpu",
+            supported_specs=supported_specs,
+        )
+    assert "not_a_real_type" in str(exc_info.value)
+    assert "RenderBufferKind" in str(exc_info.value)

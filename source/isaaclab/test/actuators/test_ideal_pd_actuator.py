@@ -1,0 +1,183 @@
+# Copyright (c) 2025-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+import pytest
+import torch
+
+from isaaclab.actuators import IdealPDActuatorCfg
+from isaaclab.test.utils import test_devices
+from isaaclab.utils import instantiate
+from isaaclab.utils.types import ArticulationActions
+
+pytestmark = pytest.mark.integration
+
+# Shapes broadcast the same scalar parameters, so one multi-env, multi-joint shape covers them.
+NUM_ENVS, NUM_JOINTS = 2, 2
+
+
+@pytest.mark.parametrize("device", test_devices())
+@pytest.mark.parametrize("usd_default", [False, True])
+def test_ideal_pd_actuator_init_minimum(device, usd_default):
+    """Test initialization of ideal pd actuator with minimum configuration."""
+    num_envs, num_joints = NUM_ENVS, NUM_JOINTS
+
+    joint_names = [f"joint_{d}" for d in range(num_joints)]
+    joint_ids = [d for d in range(num_joints)]
+    stiffness = None if usd_default else 200
+    damping = None if usd_default else 10
+
+    actuator_cfg = IdealPDActuatorCfg(
+        joint_names_expr=joint_names,
+        stiffness=stiffness,
+        damping=damping,
+    )
+    # assume Articulation class:
+    #   - finds joints (names and ids) associate with the provided joint_names_expr
+
+    # faux usd defaults
+    stiffness_default = 300
+    damping_default = 20
+
+    actuator = instantiate(
+        actuator_cfg,
+        joint_names=joint_names,
+        joint_ids=joint_ids,
+        num_envs=num_envs,
+        device=device,
+        stiffness=stiffness_default,
+        damping=damping_default,
+    )
+
+    # check initialized actuator
+    assert actuator.is_implicit_model is False
+    # check device and shape
+    torch.testing.assert_close(actuator.computed_effort, torch.zeros(num_envs, num_joints, device=device))
+    torch.testing.assert_close(actuator.applied_effort, torch.zeros(num_envs, num_joints, device=device))
+
+    torch.testing.assert_close(
+        actuator.actuator_effort_limit, torch.inf * torch.ones(num_envs, num_joints, device=device)
+    )
+    with pytest.warns(DeprecationWarning, match="actuator_effort_limit"):
+        torch.testing.assert_close(actuator.effort_limit, actuator.actuator_effort_limit)
+    torch.testing.assert_close(
+        actuator.actuator_velocity_limit, torch.inf * torch.ones(num_envs, num_joints, device=device)
+    )
+
+    if not usd_default:
+        torch.testing.assert_close(actuator.stiffness, stiffness * torch.ones(num_envs, num_joints, device=device))
+        torch.testing.assert_close(actuator.damping, damping * torch.ones(num_envs, num_joints, device=device))
+    else:
+        torch.testing.assert_close(
+            actuator.stiffness, stiffness_default * torch.ones(num_envs, num_joints, device=device)
+        )
+        torch.testing.assert_close(actuator.damping, damping_default * torch.ones(num_envs, num_joints, device=device))
+
+
+@pytest.mark.parametrize("cfg_limit", [None, 300])
+@pytest.mark.parametrize(
+    "limit_name",
+    ["actuator_effort_limit", "actuator_velocity_limit"],
+)
+def test_ideal_pd_actuator_init_limits(cfg_limit, limit_name):
+    """Test that a cfg-provided limit wins over the constructor default for effort and velocity limits.
+
+    Note Ideal PD actuator does not use velocity limits in computation, they are passed to physics via articulations.
+    """
+    num_envs, num_joints, device = NUM_ENVS, NUM_JOINTS, "cpu"
+    # used as a standin for the usd default value read in by articulation.
+    limit_default = 5000
+
+    joint_names = [f"joint_{d}" for d in range(num_joints)]
+    joint_ids = [d for d in range(num_joints)]
+
+    actuator_cfg = IdealPDActuatorCfg(
+        joint_names_expr=joint_names,
+        stiffness=200,
+        damping=10,
+        **{limit_name: cfg_limit},
+    )
+
+    actuator = instantiate(
+        actuator_cfg,
+        joint_names=joint_names,
+        joint_ids=joint_ids,
+        num_envs=num_envs,
+        device=device,
+        stiffness=actuator_cfg.stiffness,
+        damping=actuator_cfg.damping,
+        **{limit_name: limit_default},
+    )
+    limit_expected = cfg_limit if cfg_limit is not None else limit_default
+    torch.testing.assert_close(
+        getattr(actuator, limit_name), limit_expected * torch.ones(num_envs, num_joints, device=device)
+    )
+
+
+@pytest.mark.parametrize("effort_lim", [None, 300])
+def test_ideal_pd_compute(effort_lim):
+    """Test the computation of the ideal pd actuator."""
+    num_envs, num_joints, device = NUM_ENVS, NUM_JOINTS, "cpu"
+
+    joint_names = [f"joint_{d}" for d in range(num_joints)]
+    joint_ids = [d for d in range(num_joints)]
+    stiffness = 200
+    damping = 10
+    actuator_cfg = IdealPDActuatorCfg(
+        joint_names_expr=joint_names,
+        stiffness=stiffness,
+        damping=damping,
+        actuator_effort_limit=effort_lim,
+    )
+
+    actuator = instantiate(
+        actuator_cfg,
+        joint_names=joint_names,
+        joint_ids=joint_ids,
+        num_envs=num_envs,
+        device=device,
+        stiffness=actuator_cfg.stiffness,
+        damping=actuator_cfg.damping,
+    )
+    desired_pos = 10.0
+    desired_vel = 0.1
+    measured_joint_pos = 1.0
+    measured_joint_vel = -0.1
+
+    desired_control_action = ArticulationActions()
+    desired_control_action.joint_positions = desired_pos * torch.ones(num_envs, num_joints, device=device)
+    desired_control_action.joint_velocities = desired_vel * torch.ones(num_envs, num_joints, device=device)
+    desired_control_action.joint_efforts = torch.zeros(num_envs, num_joints, device=device)
+
+    expected_comp_joint_effort = stiffness * (desired_pos - measured_joint_pos) + damping * (
+        desired_vel - measured_joint_vel
+    )
+
+    computed_control_action = actuator.compute(
+        desired_control_action,
+        measured_joint_pos * torch.ones(num_envs, num_joints, device=device),
+        measured_joint_vel * torch.ones(num_envs, num_joints, device=device),
+    )
+
+    torch.testing.assert_close(
+        expected_comp_joint_effort * torch.ones(num_envs, num_joints, device=device), actuator.computed_effort
+    )
+
+    if effort_lim is None:
+        torch.testing.assert_close(
+            expected_comp_joint_effort * torch.ones(num_envs, num_joints, device=device), actuator.applied_effort
+        )
+    else:
+        torch.testing.assert_close(
+            effort_lim * torch.ones(num_envs, num_joints, device=device), actuator.applied_effort
+        )
+    torch.testing.assert_close(
+        actuator.applied_effort,
+        computed_control_action.joint_efforts,
+    )
+    torch.testing.assert_close(actuator._clip_effort(actuator.computed_effort), actuator.applied_effort)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "--maxfail=1"])

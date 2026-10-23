@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: isaaclab_newton
+Version: 10.1.0
+Summary: Extension providing IsaacLab with Newton specific abstractions.
+Author: Isaac Lab Project Developers
+Maintainer: Isaac Lab Project Developers
+License: BSD-3-Clause
+Project-URL: Homepage, https://github.com/isaac-sim/IsaacLab
+Project-URL: Repository, https://github.com/isaac-sim/IsaacLab
+Keywords: robotics,simulation,newton
+Requires-Python: >=3.12
+Requires-Dist: isaaclab

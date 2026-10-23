@@ -1,0 +1,260 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import MISSING
+from typing import TYPE_CHECKING
+
+from ...utils import configclass
+
+if TYPE_CHECKING:
+    from pxr import Usd
+
+    from .. import schemas
+
+
+@configclass
+class SpawnerCfg:
+    """Configuration parameters for spawning an asset.
+
+    Spawning an asset is done by calling the :attr:`func` function. The function takes in the
+    prim path to spawn the asset at, the configuration instance and transformation, and returns the
+    prim path of the spawned asset.
+
+    The function is typically decorated with :func:`isaaclab.sim.spawner.utils.clone` decorator
+    that checks if input prim path is a regex expression and spawns the asset at all matching prims.
+    For this, the decorator uses the Cloner API from Isaac Sim and handles the :attr:`copy_from_source`
+    parameter.
+    """
+
+    func: Callable[..., Usd.Prim] = MISSING
+    """Function to use for spawning the asset.
+
+    The function takes in the prim path (or expression) to spawn the asset at, the configuration instance
+    and transformation, and returns the source prim spawned.
+    """
+
+    visible: bool = True
+    """Whether the spawned asset should be visible. Defaults to True."""
+
+    semantic_tags: list[tuple[str, str]] | None = None
+    """List of semantic tags to add to the spawned asset. Defaults to None,
+    which means no semantic tags will be added.
+
+    The semantic tags follow the `Replicator Semantic` tagging system. Each tag is a tuple of the
+    form ``(type, data)``, where ``type`` is the type of the tag and ``data`` is the semantic label
+    associated with the tag. For example, to annotate a spawned asset in the class avocado, the semantic
+    tag would be ``[("class", "avocado")]``.
+
+    You can specify multiple semantic tags by passing in a list of tags. For example, to annotate a
+    spawned asset in the class avocado and the color green, the semantic tags would be
+    ``[("class", "avocado"), ("color", "green")]``.
+
+    .. seealso::
+
+        For more information on the semantics filter, see the documentation for the `semantics schema editor`_.
+
+    .. _semantics schema editor: https://docs.omniverse.nvidia.com/extensions/latest/ext_replicator/semantics_schema_editor.html#semantics-filtering
+
+    """
+
+    copy_from_source: bool = True
+    """Whether to copy the asset from the source prim or inherit it. Defaults to True.
+
+    This parameter is only used when cloning prims. If False, then the asset will be inherited from
+    the source prim, i.e. all USD changes to the source prim will be reflected in the cloned prims.
+    """
+
+    spawn_path: str | None = None
+    """Path where the prototype is spawned. Defaults to None."""
+
+
+@configclass
+class RigidObjectSpawnerCfg(SpawnerCfg):
+    """Configuration parameters for spawning a rigid asset.
+
+    Note:
+        By default, all properties are set to None. This means that no properties will be added or modified
+        to the prim outside of the properties available by default when spawning the prim.
+    """
+
+    mass_props: (
+        dict[str, list[schemas.MassFragment]]
+        | schemas.MassFragment
+        | list[schemas.MassFragment]
+        | schemas.MassPropertiesCfg
+        | None
+    ) = None
+    """Mass properties.
+
+    Accepts either a mapping from target pattern to a list of
+    :class:`~isaaclab.sim.schemas.MassFragment` fragments (e.g. ``{"/.*": [MassCfg(...)]}``) or a
+    single legacy :class:`~isaaclab.sim.schemas.MassPropertiesCfg`. On the fragment path each
+    fragment writes its own namespace.
+
+    Keys are regular-expression suffixes appended to the prim the spawner anchors this family on (for USD assets: the
+    spawn prim; for shapes and meshes: the container prim), so a key carries its own leading ``/`` when it targets
+    descendants (``""`` the anchor itself, ``"/[^/]+"`` its direct children, ``"/.*"`` everything beneath it). Entries
+    apply in insertion order, so on overlapping targets later entries override earlier ones per attribute. As a
+    shorthand for the common case, a bare fragment or a list of fragments is read as ``{"": [...]}``, i.e. the anchor
+    prim itself.
+    """
+
+    mass_props_create_if_missing: bool = False
+    """Whether the mass writer may apply ``UsdPhysics.MassAPI`` to matched prims that lack it.
+    Defaults to False. The flag applies to every entry of the :attr:`mass_props` mapping.
+
+    Only consumed when :attr:`mass_props` is given as fragments and the asset is spawned from a
+    USD file; the shape and mesh spawners always create the API on the bare prim they author.
+    """
+
+    rigid_props: (
+        dict[str, list[schemas.RigidBodyFragment]]
+        | schemas.RigidBodyFragment
+        | list[schemas.RigidBodyFragment]
+        | schemas.RigidBodyBaseCfg
+        | None
+    ) = None
+    """Rigid body properties.
+
+    Accepts either a mapping from target pattern to a list of
+    :class:`~isaaclab.sim.schemas.RigidBodyFragment` fragments
+    (e.g. ``{"/.*": [UsdPhysicsRigidBodyCfg(...), PhysxRigidBodyCfg(...)]}``) or a single legacy cfg
+    (e.g. :class:`~isaaclab.sim.schemas.RigidBodyBaseCfg`). On the fragment path each fragment
+    writes its own namespace.
+
+    Keys are regular-expression suffixes appended to the prim the spawner anchors this family on (for USD assets: the
+    spawn prim; for shapes and meshes: the container prim), so a key carries its own leading ``/`` when it targets
+    descendants (``""`` the anchor itself, ``"/[^/]+"`` its direct children, ``"/.*"`` everything beneath it). Entries
+    apply in insertion order, so on overlapping targets later entries override earlier ones per attribute. As a
+    shorthand for the common case, a bare fragment or a list of fragments is read as ``{"": [...]}``, i.e. the anchor
+    prim itself.
+
+    For making a rigid object static, set the :attr:`schemas.RigidBodyBaseCfg.kinematic_enabled`
+    (or :attr:`~isaaclab.sim.schemas.UsdPhysicsRigidBodyCfg.kinematic_enabled`) as True. This will
+    make the object static and will not be affected by gravity or other forces.
+    """
+
+    collision_props: (
+        dict[str, list[schemas.CollisionFragment]]
+        | schemas.CollisionFragment
+        | list[schemas.CollisionFragment]
+        | schemas.CollisionPropertiesCfg
+        | None
+    ) = None
+    """Properties to apply to all collision meshes.
+
+    Accepts either a mapping from target pattern to a list of
+    :class:`~isaaclab.sim.schemas.CollisionFragment` fragments
+    (e.g. ``{"/.*": [UsdPhysicsCollisionCfg(...), PhysxCollisionCfg(...)]}``) or a single legacy cfg
+    (e.g. :class:`~isaaclab.sim.schemas.CollisionBaseCfg`). On the fragment path each fragment
+    writes its own namespace.
+
+    Keys are regular-expression suffixes appended to the prim the spawner anchors this family on (for USD assets: the
+    spawn prim; for shapes and meshes: the geometry prim the spawner authors), so a key carries its own leading ``/``
+    when it targets descendants (``""`` the anchor itself, ``"/[^/]+"`` its direct children, ``"/.*"`` everything
+    beneath it). Entries apply in insertion order, so on overlapping targets later entries override earlier ones per
+    attribute. As a shorthand for the common case, a bare fragment or a list of fragments is read as ``{"": [...]}``,
+    i.e. the anchor prim itself.
+    """
+
+    mesh_collision_props: (
+        dict[str, list[schemas.MeshCollisionFragment]]
+        | schemas.MeshCollisionFragment
+        | list[schemas.MeshCollisionFragment]
+        | schemas.MeshCollisionBaseCfg
+        | None
+    ) = None
+    """Mesh-collision properties for existing colliders. Defaults to None.
+
+    Accepts a fragment, a list of fragments, a target-pattern mapping, or a legacy
+    :class:`~isaaclab.sim.schemas.MeshCollisionBaseCfg`. Patterns anchor at the spawn prim for file
+    spawners and the geometry prim for shape and mesh spawners. A bare value reaches every collider
+    under a file asset or the geometry collider of a shape or mesh. Non-colliders are ignored.
+    Deformable spawners reject this slot because they collide through their simulation mesh.
+    """
+
+    activate_contact_sensors: bool = False
+    """Activate contact reporting on all rigid bodies. Defaults to False.
+
+    This adds the PhysxContactReporter API to all the rigid bodies in the given prim path and its children.
+    """
+
+
+@configclass
+class DeformableObjectSpawnerCfg(SpawnerCfg):
+    """Configuration parameters for spawning a deformable asset.
+
+    Unlike rigid objects, deformable objects are affected by forces and can deform when subjected to
+    external forces. This class is used to configure the properties of the deformable object.
+
+    Deformable bodies collide through their simulation mesh, so collision offsets are set through the mesh
+    spawner's ``collision_props`` rather than :attr:`deformable_props`.
+
+    When a deformable slot (:attr:`volume_deformable_props` or :attr:`surface_deformable_props`) is set,
+    collision tuning rides the :attr:`~isaaclab.sim.spawners.RigidObjectSpawnerCfg.collision_props` family
+    keyed to the created simulation mesh (e.g. ``{"/sim_mesh": [...]}``), anchored at the spawn prim.
+
+    Note:
+        By default, all properties are set to None. This means that no properties will be added or modified
+        to the prim outside of the properties available by default when spawning the prim.
+    """
+
+    mass_props: schemas.MassPropertiesCfg | None = None
+    """Mass properties."""
+
+    deformable_props: schemas.DeformableBodyPropertiesBaseCfg | None = None
+    """Deformable body properties.
+
+    .. deprecated:: 3.1
+        Use :attr:`volume_deformable_props` or :attr:`surface_deformable_props` with deformable-body
+        schema fragments instead. This field has no deformable type of its own: it authors a surface
+        deformable when the spawner's ``physics_material`` is a
+        :class:`~isaaclab.sim.spawners.materials.SurfaceDeformableBodyMaterialBaseCfg` and a volume
+        deformable otherwise, so pick the slot the same way. The field emits no warning of its own:
+        the legacy cfgs it takes warn when constructed, and spawning through it calls the deprecated
+        deformable writers, which warn as well. This field will be removed in 3.2.
+    """
+
+    volume_deformable_props: (
+        dict[str, list[schemas.DeformableBodyFragment]]
+        | schemas.DeformableBodyFragment
+        | list[schemas.DeformableBodyFragment]
+        | None
+    ) = None
+    """Volume (tetrahedral FEM) deformable-body properties as a mapping from target pattern to a
+    list of :class:`~isaaclab.sim.schemas.DeformableBodyFragment` fragments.
+
+    Keys are regular-expression suffixes appended to the spawn prim (the container prim for both mesh and USD assets),
+    so a key carries its own leading ``/`` when it targets descendants (``""`` the spawn prim, ``"/[^/]+"`` its direct
+    children, ``"(/.*)?"`` the spawn prim and its whole subtree). Entries are applied in insertion order, so on
+    overlapping targets later entries override earlier ones per attribute. The spawner always creates missing
+    deformable setups on matched prims (equivalent to ``create_if_missing=True``); the simulation mesh is created as a
+    ``sim_mesh`` child of each target.
+
+    As a shorthand, a bare fragment or a list of fragments is read as ``{"": [...]}``, i.e. the spawn
+    prim itself, on every spawner type. Unlike the rigid-body, collision, and mass slots, the shorthand
+    never widens to the spawn prim's subtree: the deformable writers create a whole simulation-mesh
+    setup on each target, so a subtree default would tetrahedralize every mesh under the asset.
+
+    At most one of :attr:`volume_deformable_props`, :attr:`surface_deformable_props`, and the
+    legacy :attr:`deformable_props` may be set. ``UsdPhysics.MassAPI`` is ignored for deformable
+    bodies; set mass through :class:`~isaaclab.sim.schemas.OmniPhysicsDeformableBodyCfg`.
+    """
+
+    surface_deformable_props: (
+        dict[str, list[schemas.DeformableBodyFragment]]
+        | schemas.DeformableBodyFragment
+        | list[schemas.DeformableBodyFragment]
+        | None
+    ) = None
+    """Surface (cloth/triangle-mesh) deformable-body properties as a mapping from target pattern
+    to a list of :class:`~isaaclab.sim.schemas.DeformableBodyFragment` fragments.
+
+    Same key semantics and shorthand as :attr:`volume_deformable_props`; the simulation mesh is a
+    triangle-mesh copy of the visual mesh instead of a tetrahedral mesh.
+    """

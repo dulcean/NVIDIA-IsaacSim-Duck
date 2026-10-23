@@ -1,0 +1,149 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Wrapper to configure an environment instance to skrl environment.
+
+The following example shows how to wrap an environment for skrl:
+
+.. code-block:: python
+
+    from isaaclab_rl.skrl import SkrlVecEnvWrapper
+
+    env = SkrlVecEnvWrapper(env, ml_framework="torch")  # or ml_framework="jax"
+
+Or, equivalently, by directly calling the skrl library API as follows:
+
+.. code-block:: python
+
+    from skrl.envs.torch.wrappers import wrap_env  # for PyTorch, or...
+    from skrl.envs.jax.wrappers import wrap_env  # for JAX
+
+    env = wrap_env(env, wrapper="isaaclab")
+
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Literal
+
+from packaging import version
+
+from .utils.env_types import check_env_type
+
+if TYPE_CHECKING:
+    from isaaclab.envs import DirectMARLEnv, DirectRLEnv, ManagerBasedRLEnv
+
+SKRL_MIN_VERSION = "2.1.0"
+"""Oldest skrl release supported by the entrypoints."""
+
+
+def check_skrl_version() -> None:
+    """Exit with an installation hint when the installed skrl release is too old.
+
+    Raises:
+        SystemExit: If the installed skrl version is older than :data:`SKRL_MIN_VERSION`.
+    """
+    # skrl is an optional dependency; only the entrypoints that run it need it installed
+    import skrl
+
+    if version.parse(skrl.__version__) < version.parse(SKRL_MIN_VERSION):
+        skrl.logger.error(
+            f"Unsupported skrl version: {skrl.__version__}. "
+            f"Install supported version using 'pip install skrl>={SKRL_MIN_VERSION}'"
+        )
+        raise SystemExit(1)
+
+
+def import_skrl_runner(ml_framework: Literal["torch", "jax"]) -> type:
+    """Return the skrl :class:`Runner` implementation of the selected ML framework.
+
+    Args:
+        ml_framework: ML framework the agent runs on.
+
+    Raises:
+        ValueError: If the ML framework has no skrl runner.
+    """
+    if ml_framework == "torch":
+        from skrl.utils.runner.torch import Runner
+    elif ml_framework == "jax":
+        from skrl.utils.runner.jax import Runner
+    else:
+        raise ValueError(f"Invalid ML framework for the skrl runner: {ml_framework}. Available options: 'torch', 'jax'")
+    return Runner
+
+
+def resolve_skrl_agent_cfg_entry_point(agent: str | None, algorithm: str | None) -> str:
+    """Return the explicit agent recipe, an algorithm recipe, or the canonical recipe."""
+    if agent is not None:
+        return agent
+    if algorithm is None or algorithm.lower() == "ppo":
+        return "skrl_cfg_entry_point"
+    return f"skrl_{algorithm.lower()}_cfg_entry_point"
+
+
+def resolve_skrl_algorithm(agent_cfg: Mapping[str, object], requested_algorithm: str | None = None) -> str:
+    """Return ``agent.class``, rejecting malformed configs and explicit-selector mismatches."""
+    agent = agent_cfg.get("agent")
+    agent_class = agent.get("class") if isinstance(agent, Mapping) else None
+    if not isinstance(agent_class, str) or not agent_class.strip():
+        raise ValueError("The resolved SKRL configuration must define a non-empty 'agent.class' string.")
+
+    algorithm = agent_class.lower()
+    if requested_algorithm is not None and requested_algorithm.lower() != algorithm:
+        raise ValueError(
+            f"Requested SKRL algorithm {requested_algorithm!r} does not match the resolved agent.class {agent_class!r}."
+        )
+    return algorithm
+
+
+"""
+Vectorized environment wrapper.
+"""
+
+
+def SkrlVecEnvWrapper(
+    env: ManagerBasedRLEnv | DirectRLEnv | DirectMARLEnv,
+    ml_framework: Literal["torch", "jax", "warp"] = "torch",
+    wrapper: Literal["auto", "isaaclab", "isaaclab-single-agent", "isaaclab-multi-agent"] = "isaaclab",
+):
+    """Wraps around Isaac Lab environment for skrl.
+
+    This function wraps around the Isaac Lab environment. Since the wrapping
+    functionality is defined within the skrl library itself, this implementation
+    is maintained for compatibility with the structure of the extension that contains it.
+    Internally it calls the :func:`wrap_env` from the skrl library API.
+
+    Args:
+        env: The environment to wrap around.
+        ml_framework: The ML framework to use for the wrapper. Defaults to "torch".
+        wrapper: The wrapper to use. Defaults to "isaaclab": leave it to skrl to determine if the environment
+            will be wrapped as single-agent or multi-agent.
+
+    Raises:
+        ValueError: When the environment is not an instance of any Isaac Lab environment interface.
+        ValueError: If the specified ML framework is not valid.
+
+    Reference:
+        https://skrl.readthedocs.io/en/latest/api/envs/wrapping.html
+    """
+    check_env_type(env, allow_multi_agent=True)
+
+    # the skrl wrapper module depends on the selected ML framework
+    if ml_framework.startswith("torch"):
+        from skrl.envs.wrappers.torch import wrap_env
+    elif ml_framework.startswith("jax"):
+        # preload submodule that skrl's distributed models use without importing (broken on recent JAX)
+        import jax.experimental.multihost_utils  # noqa: F401
+        from skrl.envs.wrappers.jax import wrap_env
+    elif ml_framework.startswith("warp"):
+        from skrl.envs.wrappers.warp import wrap_env
+    else:
+        raise ValueError(
+            f"Invalid ML framework for skrl: {ml_framework}. Available options are: 'torch', 'jax', 'warp'"
+        )
+
+    # wrap and return the environment
+    return wrap_env(env, wrapper)

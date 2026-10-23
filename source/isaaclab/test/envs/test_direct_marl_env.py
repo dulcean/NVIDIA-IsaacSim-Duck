@@ -1,0 +1,41 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+# ignore private usage of variables warning
+# pyright: reportPrivateUsage=none
+
+from __future__ import annotations
+
+from isaaclab.test.utils import launch_test_simulation
+
+launch_test_simulation()
+
+import pytest
+
+import isaaclab.sim as sim_utils
+from isaaclab.envs import DirectMARLEnv
+from isaaclab.test.env_cfgs import make_empty_direct_marl_env_cfg
+from isaaclab.test.utils import DeviceScope, test_devices
+
+pytestmark = pytest.mark.integration
+
+
+# Close bookkeeping is device independent; per-agent spaces are covered in test_direct_marl_env_unit.py.
+@pytest.mark.parametrize("device", test_devices(DeviceScope.DEFAULT_CUDA))
+def test_initialization_and_close(device):
+    """DirectMARLEnv initializes its spaces and releases its simulation context."""
+    sim_utils.create_new_stage()
+    env = DirectMARLEnv(cfg=make_empty_direct_marl_env_cfg(device=device))
+
+    try:
+        assert not env._is_closed
+        assert sim_utils.SimulationContext.instance() is env.sim
+        assert env.num_agents == 2
+        assert env.state_space.shape == (7,)
+    finally:
+        env.close()
+
+    assert env._is_closed
+    assert sim_utils.SimulationContext.instance() is None

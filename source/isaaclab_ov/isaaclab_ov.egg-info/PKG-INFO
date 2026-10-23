@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: isaaclab_ov
+Version: 7.1.0
+Summary: Extension providing Omniverse rendering and OVPhysX simulation integrations.
+Author: Isaac Lab Project Developers
+Maintainer: Isaac Lab Project Developers
+License: BSD-3-Clause
+Project-URL: Homepage, https://github.com/isaac-sim/IsaacLab
+Project-URL: Repository, https://github.com/isaac-sim/IsaacLab
+Keywords: robotics,simulation,rendering,ovphysx,ovrtx,omniverse
+Requires-Python: >=3.12
+Requires-Dist: isaaclab
+Requires-Dist: ovstage==0.2.1.385922

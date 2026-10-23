@@ -1,0 +1,920 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Common functions that can be used to create observation terms.
+
+The functions can be passed to the :class:`isaaclab.managers.ObservationTermCfg` object to enable
+the observation introduced by the function.
+"""
+
+from __future__ import annotations
+
+import functools
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+import torch
+from typing_extensions import deprecated
+
+from ...managers import SceneEntityCfg
+from ...managers.manager_base import ManagerTermBase
+from ...managers.manager_term_cfg import ObservationTermCfg
+from ...utils import math as math_utils
+from ...utils.images import (
+    CameraFrameStack,
+    is_depth_like,
+    is_normals_like,
+    is_rgb_like,
+    normalize_camera_image,
+    normalize_depth,
+    normalize_normals,
+    normalize_rgb,
+    normalize_segmentation,
+)
+
+if TYPE_CHECKING:
+    from ...assets import Articulation, RigidObject
+    from ...sensors import Camera, Imu, JointWrenchSensor, Pva, RayCaster, RayCasterCamera
+    from .. import ManagerBasedEnv, ManagerBasedRLEnv
+
+from ..utils.io_descriptors import (
+    generic_io_descriptor,
+    record_body_names,
+    record_dtype,
+    record_joint_names,
+    record_joint_pos_offsets,
+    record_joint_vel_offsets,
+    record_shape,
+)
+
+"""
+Root state.
+"""
+
+
+@generic_io_descriptor(units="m", axes=["Z"], observation_type="RootState", on_inspect=[record_shape, record_dtype])
+def base_pos_z(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Root height in the simulation world frame."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return asset.data.root_pos_w.torch[:, 2].unsqueeze(-1)
+
+
+@generic_io_descriptor(
+    units="m/s", axes=["X", "Y", "Z"], observation_type="RootState", on_inspect=[record_shape, record_dtype]
+)
+def base_lin_vel(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Root linear velocity in the asset's root frame."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    return asset.data.root_lin_vel_b.torch
+
+
+@generic_io_descriptor(
+    units="rad/s", axes=["X", "Y", "Z"], observation_type="RootState", on_inspect=[record_shape, record_dtype]
+)
+def base_ang_vel(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Root angular velocity in the asset's root frame."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    return asset.data.root_ang_vel_b.torch
+
+
+@generic_io_descriptor(
+    units="m/s^2", axes=["X", "Y", "Z"], observation_type="RootState", on_inspect=[record_shape, record_dtype]
+)
+def projected_gravity(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Gravity projection on the asset's root frame."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    return asset.data.projected_gravity_b.torch
+
+
+@generic_io_descriptor(
+    units="m", axes=["X", "Y", "Z"], observation_type="RootState", on_inspect=[record_shape, record_dtype]
+)
+def root_pos_w(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Asset root position in the environment frame."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    return asset.data.root_pos_w.torch - env.scene.env_origins
+
+
+@generic_io_descriptor(
+    units="unit", axes=["W", "X", "Y", "Z"], observation_type="RootState", on_inspect=[record_shape, record_dtype]
+)
+def root_quat_w(
+    env: ManagerBasedEnv, make_quat_unique: bool = False, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Asset root orientation (x, y, z, w) in the environment frame.
+
+    If :attr:`make_quat_unique` is True, then returned quaternion is made unique by ensuring
+    the quaternion has non-negative real component. This is because both ``q`` and ``-q`` represent
+    the same orientation.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    quat = asset.data.root_quat_w.torch
+    # make the quaternion real-part positive if configured
+    return math_utils.quat_unique(quat) if make_quat_unique else quat
+
+
+@generic_io_descriptor(
+    units="m/s", axes=["X", "Y", "Z"], observation_type="RootState", on_inspect=[record_shape, record_dtype]
+)
+def root_lin_vel_w(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Asset root linear velocity in the environment frame."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    return asset.data.root_lin_vel_w.torch
+
+
+@generic_io_descriptor(
+    units="rad/s", axes=["X", "Y", "Z"], observation_type="RootState", on_inspect=[record_shape, record_dtype]
+)
+def root_ang_vel_w(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Asset root angular velocity in the environment frame."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    return asset.data.root_ang_vel_w.torch
+
+
+"""
+Body state
+"""
+
+
+@generic_io_descriptor(observation_type="BodyState", on_inspect=[record_shape, record_dtype, record_body_names])
+def body_pose_w(
+    env: ManagerBasedEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """The flattened body poses of the asset w.r.t the env.scene.origin.
+
+    Note: Only the bodies configured in :attr:`asset_cfg.body_ids` will have their poses returned.
+
+    Args:
+        env: The environment.
+        asset_cfg: The SceneEntity associated with this observation.
+
+    Returns:
+        The poses of bodies in articulation [num_env, 7 * num_bodies]. Pose order is [x,y,z,qw,qx,qy,qz].
+        Output is stacked horizontally per body.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    pose = asset.data.body_pose_w.torch[:, asset_cfg.body_ids, :7]
+    if isinstance(asset_cfg.body_ids, (slice, int)):
+        pose = pose.clone()  # if slice or int, make a copy to avoid modifying original data
+    pose[..., :3] = pose[..., :3] - env.scene.env_origins.unsqueeze(1)
+    return pose.reshape(env.num_envs, -1)
+
+
+@generic_io_descriptor(observation_type="BodyState", on_inspect=[record_shape, record_dtype, record_body_names])
+def body_projected_gravity_b(
+    env: ManagerBasedEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """The direction of gravity projected on to bodies of an Articulation.
+
+    Note: Only the bodies configured in :attr:`asset_cfg.body_ids` will have their poses returned.
+
+    Args:
+        env: The environment.
+        asset_cfg: The Articulation associated with this observation.
+
+    Returns:
+        The unit vector direction of gravity projected onto body_name's frame. Gravity projection vector order is
+        [x,y,z]. Output is stacked horizontally per body.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    body_quat = asset.data.body_quat_w.torch[:, asset_cfg.body_ids].reshape(env.num_envs, -1, 4)
+    # ``GRAVITY_VEC_W`` carries the per-env world-frame gravity in m/s^2 (Newton
+    # backend) or scene-wide gravity (PhysX backend).
+    gravity_w = asset.data.GRAVITY_VEC_W.torch
+    gravity_dir = torch.nn.functional.normalize(gravity_w, dim=-1).unsqueeze(1)
+    return math_utils.quat_apply_inverse(body_quat, gravity_dir).view(env.num_envs, -1)
+
+
+"""
+Joint state.
+"""
+
+
+@generic_io_descriptor(
+    observation_type="JointState", on_inspect=[record_joint_names, record_dtype, record_shape], units="rad"
+)
+def joint_pos(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """The joint positions of the asset.
+
+    Note: Only the joints configured in :attr:`asset_cfg.joint_ids` will have their positions returned.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    return asset.data.joint_pos.torch[:, asset_cfg.joint_ids]
+
+
+@generic_io_descriptor(
+    observation_type="JointState",
+    on_inspect=[record_joint_names, record_dtype, record_shape, record_joint_pos_offsets],
+    units="rad",
+)
+def joint_pos_rel(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """The joint positions of the asset w.r.t. the default joint positions.
+
+    Note: Only the joints configured in :attr:`asset_cfg.joint_ids` will have their positions returned.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    return (
+        asset.data.joint_pos.torch[:, asset_cfg.joint_ids] - asset.data.default_joint_pos.torch[:, asset_cfg.joint_ids]
+    )
+
+
+@generic_io_descriptor(observation_type="JointState", on_inspect=[record_joint_names, record_dtype, record_shape])
+def joint_pos_limit_normalized(
+    env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """The joint positions of the asset normalized with the asset's joint limits.
+
+    Note: Only the joints configured in :attr:`asset_cfg.joint_ids` will have their normalized positions returned.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    return math_utils.scale_transform(
+        asset.data.joint_pos.torch[:, asset_cfg.joint_ids],
+        asset.data.soft_joint_pos_limits.torch[:, asset_cfg.joint_ids, 0],
+        asset.data.soft_joint_pos_limits.torch[:, asset_cfg.joint_ids, 1],
+    )
+
+
+@generic_io_descriptor(
+    observation_type="JointState", on_inspect=[record_joint_names, record_dtype, record_shape], units="rad/s"
+)
+def joint_vel(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
+    """The joint velocities of the asset.
+
+    Note: Only the joints configured in :attr:`asset_cfg.joint_ids` will have their velocities returned.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    return asset.data.joint_vel.torch[:, asset_cfg.joint_ids]
+
+
+@generic_io_descriptor(
+    observation_type="JointState",
+    on_inspect=[record_joint_names, record_dtype, record_shape, record_joint_vel_offsets],
+    units="rad/s",
+)
+def joint_vel_rel(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
+    """The joint velocities of the asset w.r.t. the default joint velocities.
+
+    Note: Only the joints configured in :attr:`asset_cfg.joint_ids` will have their velocities returned.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    return (
+        asset.data.joint_vel.torch[:, asset_cfg.joint_ids] - asset.data.default_joint_vel.torch[:, asset_cfg.joint_ids]
+    )
+
+
+@generic_io_descriptor(
+    observation_type="JointState", on_inspect=[record_joint_names, record_dtype, record_shape], units="N.m"
+)
+def joint_effort(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """The joint applied effort of the robot.
+
+    NOTE: Only the joints configured in :attr:`asset_cfg.joint_ids` will have their effort returned.
+
+    Args:
+        env: The environment.
+        asset_cfg: The SceneEntity associated with this observation.
+
+    Returns:
+        The joint effort (N or N-m) for joint_names in asset_cfg, shape is [num_env,num_joints].
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    return asset.actuators.applied_effort.torch[:, asset_cfg.joint_ids]
+
+
+"""
+Sensors.
+"""
+
+
+def height_scan(env: ManagerBasedEnv, sensor_cfg: SceneEntityCfg, offset: float = 0.5) -> torch.Tensor:
+    """Height scan from the given sensor w.r.t. the sensor's frame.
+
+    The provided offset (Defaults to 0.5) is subtracted from the returned values.
+    """
+    sensor: RayCaster = env.scene.sensors[sensor_cfg.name]
+    # height scan: height = sensor_height - hit_point_z - offset
+    return sensor.data.pos_w.torch[:, 2].unsqueeze(1) - sensor.data.ray_hits_w.torch[..., 2] - offset
+
+
+def body_incoming_wrench(env: ManagerBasedEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Incoming spatial wrench [N, N·m] on bodies of an articulation in the sensor convention.
+
+    This is the 6-D wrench (force followed by torque) applied to the body link by the incoming joint force.
+    """
+    sensor: JointWrenchSensor = env.scene.sensors[sensor_cfg.name]
+    sensor_data = sensor.data
+    force_data = sensor_data.force
+    torque_data = sensor_data.torque
+    if force_data is None or torque_data is None:
+        raise RuntimeError("Joint wrench sensor data is not initialized. Call sim.reset() before reading observations.")
+    force = force_data.torch[:, sensor_cfg.body_ids]
+    torque = torque_data.torch[:, sensor_cfg.body_ids]
+    return torch.cat((force, torque), dim=-1).view(env.num_envs, -1)
+
+
+def pva_orientation(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("pva")) -> torch.Tensor:
+    """PVA sensor orientation in the simulation world frame.
+
+    Args:
+        env: The environment.
+        asset_cfg: The SceneEntity associated with a PVA sensor. Defaults to SceneEntityCfg("pva").
+
+    Returns:
+        Orientation in the world frame in (x, y, z, w) quaternion form. Shape is (num_envs, 4).
+    """
+    asset: Pva = env.scene[asset_cfg.name]
+    return asset.data.quat_w.torch
+
+
+def pva_projected_gravity(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("pva")) -> torch.Tensor:
+    """PVA sensor projected gravity in the sensor frame.
+
+    Args:
+        env: The environment.
+        asset_cfg: The SceneEntity associated with a PVA sensor. Defaults to SceneEntityCfg("pva").
+
+    Returns:
+        Gravity projected on sensor frame, shape of torch.tensor is (num_env, 3).
+    """
+    asset: Pva = env.scene[asset_cfg.name]
+    return asset.data.projected_gravity_b.torch
+
+
+def imu_ang_vel(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("imu")) -> torch.Tensor:
+    """IMU sensor angular velocity w.r.t. environment origin expressed in the sensor frame [rad/s].
+
+    Args:
+        env: The environment.
+        asset_cfg: The SceneEntity associated with an IMU sensor. Defaults to SceneEntityCfg("imu").
+
+    Returns:
+        The angular velocity [rad/s] in the sensor frame. Shape is (num_envs, 3).
+    """
+    asset: Imu = env.scene[asset_cfg.name]
+    return asset.data.ang_vel_b.torch
+
+
+def imu_lin_acc(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("imu")) -> torch.Tensor:
+    """IMU sensor linear acceleration w.r.t. the environment origin expressed in sensor frame [m/s^2].
+
+    Args:
+        env: The environment.
+        asset_cfg: The SceneEntity associated with an IMU sensor. Defaults to SceneEntityCfg("imu").
+
+    Returns:
+        The linear acceleration [m/s^2] in the sensor frame. Shape is (num_envs, 3).
+    """
+    asset: Imu = env.scene[asset_cfg.name]
+    return asset.data.lin_acc_b.torch
+
+
+def _read_camera_output(
+    env: ManagerBasedEnv,
+    sensor_cfg: SceneEntityCfg,
+    data_type: str,
+    convert_perspective_to_orthogonal: bool = False,
+) -> torch.Tensor:
+    """Latest camera output of ``data_type``, a view of the sensor buffer. Shape is ``(B, H, W, C)``."""
+    sensor: Camera | RayCasterCamera = env.scene.sensors[sensor_cfg.name]
+    images = sensor.data.output[data_type].torch
+    if data_type == "distance_to_camera" and convert_perspective_to_orthogonal:
+        images = math_utils.orthogonalize_perspective_depth(images, sensor.data.intrinsic_matrices)
+    return images
+
+
+class CameraImageBase(ManagerTermBase):
+    """Base for camera image terms: validates the data type and owns the frame stack.
+
+    Subclasses read their sensor output and pass it with a normalizer from
+    :mod:`isaaclab.utils.images` to :attr:`_frames`. Each subclass declares a
+    ``data_type`` argument with a default in ``__call__``, which the manager
+    resolves into the term parameters before construction.
+    """
+
+    def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        data_type = cfg.params["data_type"]
+        if not self._accepts(data_type):
+            raise ValueError(f"{type(self).__name__} does not support camera data type '{data_type}'.")
+        self._frames = CameraFrameStack(
+            env.num_envs,
+            env.device,
+            frame_stack=cfg.params["frame_stack"],
+            channel_first=cfg.params["channel_first"],
+        )
+
+    def reset(self, env_ids: Sequence[int] | torch.Tensor | None = None):
+        self._frames.reset(env_ids)
+
+    @staticmethod
+    def _accepts(data_type: str) -> bool:
+        raise NotImplementedError
+
+
+class image_rgb(CameraImageBase):
+    """Color images from a camera sensor.
+
+    Reads an RGB-like output (``"rgb"``, ``"albedo"``, ``"simple_shading_*"``) and keeps its first three
+    channels, dropping albedo's unused alpha. When ``normalize`` is True, the image is scaled to
+    ``[0, 1]`` and centered with :func:`~isaaclab.utils.images.normalize_rgb`.
+
+    Args:
+        sensor_cfg: The camera sensor to read. Defaults to SceneEntityCfg("tiled_camera").
+        data_type: The RGB-like camera data type. Defaults to "rgb".
+        normalize: Whether to normalize the image. Defaults to True.
+        mean: Constant subtracted after scaling. Defaults to None, which subtracts the per-image,
+            per-channel mean.
+        channel_first: Whether to return ``(num_envs, C, H, W)``. Defaults to False.
+        frame_stack: Number of recent frames to stack along the channel axis. Defaults to 1.
+        out: Optional contiguous destination with the output shape, dtype and device. Defaults to None,
+            which allocates a new result. The observation manager supplies a fresh destination automatically.
+            Normalized uint8 frames, including stacked frames, are written directly; other inputs are copied.
+            Reusing a destination overwrites its previous contents; it must not hold a retained observation.
+
+    Returns:
+        The image, or ``out`` when supplied. Shape is ``(num_envs, H, W, 3 * frame_stack)``, or channel-first.
+    """
+
+    @staticmethod
+    def _accepts(data_type: str) -> bool:
+        return is_rgb_like(data_type)
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        sensor_cfg: SceneEntityCfg = SceneEntityCfg("tiled_camera"),
+        data_type: str = "rgb",
+        normalize: bool = True,
+        mean: float | None = None,
+        channel_first: bool = False,
+        frame_stack: int = 1,
+        *,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        images = _read_camera_output(env, sensor_cfg, data_type)[..., :3]
+        result = self._frames(images, functools.partial(normalize_rgb, mean=mean, out=out) if normalize else None)
+        if out is None:
+            return result
+        if result is not out:
+            out.copy_(result)
+        return out
+
+
+class image_depth(CameraImageBase):
+    """Depth images from a camera or ray-caster camera sensor.
+
+    Reads a depth-like output (``"depth"``, ``"distance_to_image_plane"``, ``"distance_to_camera"``).
+    When ``normalize`` is True, invalid pixels are replaced and depth is optionally rescaled with
+    :func:`~isaaclab.utils.images.normalize_depth`.
+
+    Args:
+        sensor_cfg: The camera sensor to read. Defaults to SceneEntityCfg("tiled_camera").
+        data_type: The depth-like camera data type. Defaults to "distance_to_image_plane".
+        convert_perspective_to_orthogonal: Whether to convert ``"distance_to_camera"`` into
+            distance to the image plane. Defaults to False.
+        normalize: Whether to normalize the image. Defaults to True.
+        invalid_value: Value for NaN and infinite pixels [m]. Defaults to 0.
+        max_depth: Clip depth to this range and divide by it [m]. Defaults to None.
+        tanh_scale: Map depth to ``tanh(depth / tanh_scale) - 0.5`` [m]. Defaults to None.
+        channel_first: Whether to return ``(num_envs, C, H, W)``. Defaults to False.
+        frame_stack: Number of recent frames to stack along the channel axis. Defaults to 1.
+
+    Returns:
+        The depth image, metric [m] unless rescaled. Shape is ``(num_envs, H, W, frame_stack)``,
+        or channel-first.
+    """
+
+    @staticmethod
+    def _accepts(data_type: str) -> bool:
+        return is_depth_like(data_type)
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        sensor_cfg: SceneEntityCfg = SceneEntityCfg("tiled_camera"),
+        data_type: str = "distance_to_image_plane",
+        convert_perspective_to_orthogonal: bool = False,
+        normalize: bool = True,
+        invalid_value: float = 0.0,
+        max_depth: float | None = None,
+        tanh_scale: float | None = None,
+        channel_first: bool = False,
+        frame_stack: int = 1,
+    ) -> torch.Tensor:
+        images = _read_camera_output(env, sensor_cfg, data_type, convert_perspective_to_orthogonal)
+        normalizer = None
+        if normalize:
+            normalizer = functools.partial(
+                normalize_depth, invalid_value=invalid_value, max_depth=max_depth, tanh_scale=tanh_scale
+            )
+        return self._frames(images, normalizer)
+
+
+class image_normals(CameraImageBase):
+    """Surface-normal images from a camera or ray-caster camera sensor.
+
+    When ``normalize`` is True, normals are mapped to ``[0, 1]`` with
+    :func:`~isaaclab.utils.images.normalize_normals`.
+
+    Args:
+        sensor_cfg: The camera sensor to read. Defaults to SceneEntityCfg("tiled_camera").
+        normalize: Whether to normalize the image. Defaults to True.
+        channel_first: Whether to return ``(num_envs, C, H, W)``. Defaults to False.
+        frame_stack: Number of recent frames to stack along the channel axis. Defaults to 1.
+        data_type: The surface-normal camera data type. Defaults to "normals".
+
+    Returns:
+        The normals image. Shape is ``(num_envs, H, W, 3 * frame_stack)``, or channel-first.
+    """
+
+    @staticmethod
+    def _accepts(data_type: str) -> bool:
+        return is_normals_like(data_type)
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        sensor_cfg: SceneEntityCfg = SceneEntityCfg("tiled_camera"),
+        normalize: bool = True,
+        channel_first: bool = False,
+        frame_stack: int = 1,
+        *,
+        data_type: str = "normals",
+    ) -> torch.Tensor:
+        images = _read_camera_output(env, sensor_cfg, data_type)
+        return self._frames(images, normalize_normals if normalize else None)
+
+
+class image_segmentation(CameraImageBase):
+    """Segmentation images from a camera sensor.
+
+    When ``normalize`` is True, colorized segmentation is normalized like color and label-id
+    segmentation is cast to float, see :func:`~isaaclab.utils.images.normalize_segmentation`.
+
+    Args:
+        sensor_cfg: The camera sensor to read. Defaults to SceneEntityCfg("tiled_camera").
+        data_type: The segmentation camera data type. Defaults to "semantic_segmentation".
+        normalize: Whether to normalize the image. Defaults to True.
+        channel_first: Whether to return ``(num_envs, C, H, W)``. Defaults to False.
+        frame_stack: Number of recent frames to stack along the channel axis. Defaults to 1.
+
+    Returns:
+        The segmentation image. Shape is ``(num_envs, H, W, C * frame_stack)``, or channel-first.
+    """
+
+    @staticmethod
+    def _accepts(data_type: str) -> bool:
+        return "segmentation" in data_type
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        sensor_cfg: SceneEntityCfg = SceneEntityCfg("tiled_camera"),
+        data_type: str = "semantic_segmentation",
+        normalize: bool = True,
+        channel_first: bool = False,
+        frame_stack: int = 1,
+    ) -> torch.Tensor:
+        images = _read_camera_output(env, sensor_cfg, data_type)
+        return self._frames(images, normalize_segmentation if normalize else None)
+
+
+class image_features(ManagerTermBase):
+    """Extracted image features from a pre-trained frozen encoder.
+
+    This term uses models from the model zoo in PyTorch and extracts features from the images.
+
+    It reads the raw camera images and then processes them using the model zoo.
+
+    A user can provide their own model zoo configuration to use different models for feature extraction.
+    The model zoo configuration should be a dictionary that maps different model names to a dictionary
+    that defines the model, preprocess and inference functions. The dictionary should have the following
+    entries:
+
+    - "model": A callable that returns the model when invoked without arguments.
+    - "reset": A callable that resets the model. This is useful when the model has a state that needs to be reset.
+    - "inference": A callable that, when given the model and the images, returns the extracted features.
+
+    If the model zoo configuration is not provided, the default model zoo configurations are used. The default
+    model zoo configurations include the models from Theia :cite:`shang2024theia` and ResNet :cite:`he2016deep`.
+    These models are loaded from `Hugging-Face transformers <https://huggingface.co/docs/transformers/index>`_ and
+    `PyTorch torchvision <https://pytorch.org/vision/stable/models.html>`_ respectively.
+
+    Args:
+        sensor_cfg: The sensor configuration to poll. Defaults to SceneEntityCfg("tiled_camera").
+        data_type: The sensor data type. Defaults to "rgb".
+        convert_perspective_to_orthogonal: Whether to orthogonalize perspective depth images.
+            This is used only when the data type is "distance_to_camera". Defaults to False.
+        model_zoo_cfg: A user-defined dictionary that maps different model names to their respective configurations.
+            Defaults to None. If None, the default model zoo configurations are used.
+        model_name: The name of the model to use for inference. Defaults to "resnet18".
+        model_device: The device to store and infer the model on. This is useful when offloading the computation
+            from the environment simulation device. Defaults to the environment device.
+        inference_kwargs: Additional keyword arguments to pass to the inference function. Defaults to None,
+            which means no additional arguments are passed.
+
+    Returns:
+        The extracted features tensor. Shape is (num_envs, feature_dim).
+
+    Raises:
+        ValueError: When the model name is not found in the provided model zoo configuration.
+        ValueError: When the model name is not found in the default model zoo configuration.
+    """
+
+    def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+
+        self.model_zoo_cfg: dict = cfg.params["model_zoo_cfg"]  # type: ignore
+        self.model_name: str = cfg.params["model_name"]  # type: ignore
+        self.model_device: str = cfg.params["model_device"] if cfg.params["model_device"] is not None else env.device  # type: ignore
+
+        # List of Theia models - These are configured through `_prepare_theia_transformer_model` function
+        default_theia_models = [
+            "theia-tiny-patch16-224-cddsv",
+            "theia-tiny-patch16-224-cdiv",
+            "theia-small-patch16-224-cdiv",
+            "theia-base-patch16-224-cdiv",
+            "theia-small-patch16-224-cddsv",
+            "theia-base-patch16-224-cddsv",
+        ]
+        # List of ResNet models - These are configured through `_prepare_resnet_model` function
+        default_resnet_models = ["resnet18", "resnet34", "resnet50", "resnet101"]
+
+        # Check if model name is specified in the model zoo configuration
+        if self.model_zoo_cfg is not None and self.model_name not in self.model_zoo_cfg:
+            raise ValueError(
+                f"Model name '{self.model_name}' not found in the provided model zoo configuration."
+                " Please add the model to the model zoo configuration or use a different model name."
+                f" Available models in the provided list: {list(self.model_zoo_cfg.keys())}."
+                "\nHint: If you want to use a default model, consider using one of the following models:"
+                f" {default_theia_models + default_resnet_models}. In this case, you can remove the"
+                " 'model_zoo_cfg' parameter from the observation term configuration."
+            )
+        if self.model_zoo_cfg is None:
+            if self.model_name in default_theia_models:
+                model_config = self._prepare_theia_transformer_model(self.model_name, self.model_device)
+            elif self.model_name in default_resnet_models:
+                model_config = self._prepare_resnet_model(self.model_name, self.model_device)
+            else:
+                raise ValueError(
+                    f"Model name '{self.model_name}' not found in the default model zoo configuration."
+                    f" Available models: {default_theia_models + default_resnet_models}."
+                )
+        else:
+            model_config = self.model_zoo_cfg[self.model_name]
+
+        self._model = model_config["model"]()
+        self._reset_fn = model_config.get("reset")
+        self._inference_fn = model_config["inference"]
+
+    def reset(self, env_ids: torch.Tensor | None = None):
+        # reset the model if a reset function is provided
+        # this might be useful when the model has a state that needs to be reset
+        # for example: video transformers
+        if self._reset_fn is not None:
+            self._reset_fn(self._model, env_ids)
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        sensor_cfg: SceneEntityCfg = SceneEntityCfg("tiled_camera"),
+        data_type: str = "rgb",
+        convert_perspective_to_orthogonal: bool = False,
+        model_zoo_cfg: dict | None = None,
+        model_name: str = "resnet18",
+        model_device: str | None = None,
+        inference_kwargs: dict | None = None,
+    ) -> torch.Tensor:
+        # raw images: the model's inference function does its own pre-processing
+        image_data = _read_camera_output(env, sensor_cfg, data_type, convert_perspective_to_orthogonal)
+        # store the device of the image
+        image_device = image_data.device
+        # forward the images through the model
+        features = self._inference_fn(self._model, image_data, **(inference_kwargs or {}))
+        # observation terms must be flat after the environment batch dimension
+        return features.flatten(start_dim=1).detach().to(image_device)
+
+    """
+    Helper functions.
+    """
+
+    def _prepare_theia_transformer_model(self, model_name: str, model_device: str) -> dict:
+        """Prepare the Theia transformer model for inference.
+
+        Args:
+            model_name: The name of the Theia transformer model to prepare.
+            model_device: The device to store and infer the model on.
+
+        Returns:
+            A dictionary containing the model and inference functions.
+        """
+        from transformers import AutoConfig
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+        def _load_model() -> torch.nn.Module:
+            """Load the Theia transformer model."""
+            pretrained_model_name = f"theaiinstitute/{model_name}"
+            config = AutoConfig.from_pretrained(pretrained_model_name, trust_remote_code=True)
+            model_class = get_class_from_dynamic_module(config.auto_map["AutoModel"], pretrained_model_name)
+
+            # Theia initializes a pretrained backbone inside its constructor. Transformers 5 constructs
+            # models on the meta device, where nested ``from_pretrained`` calls are prohibited. Limit the
+            # legacy initialization behavior to the trusted remote class and restore it after loading.
+            had_init_context = "get_init_context" in model_class.__dict__
+            original_init_context = model_class.__dict__.get("get_init_context")
+            had_tied_weight_keys = "all_tied_weights_keys" in model_class.__dict__
+            original_tied_weight_keys = model_class.__dict__.get("all_tied_weights_keys")
+
+            def _get_init_context(_cls, *_args, **_kwargs):
+                return []
+
+            model_class.get_init_context = classmethod(_get_init_context)
+            model_class.all_tied_weights_keys = {}
+            try:
+                model = model_class.from_pretrained(pretrained_model_name, config=config).eval()
+            finally:
+                if had_init_context:
+                    model_class.get_init_context = original_init_context
+                else:
+                    del model_class.get_init_context
+                if had_tied_weight_keys:
+                    model_class.all_tied_weights_keys = original_tied_weight_keys
+                else:
+                    del model_class.all_tied_weights_keys
+            return model.to(model_device)
+
+        # ImageNet normalization statistics, created once instead of on every inference call
+        mean = torch.tensor([0.485, 0.456, 0.406], device=model_device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=model_device).view(1, 3, 1, 1)
+
+        def _inference(model, images: torch.Tensor) -> torch.Tensor:
+            """Inference the Theia transformer model.
+
+            Args:
+                model: The Theia transformer model.
+                images: The preprocessed image tensor. Shape is (num_envs, height, width, channel).
+
+            Returns:
+                The extracted features tensor. Shape is (num_envs, feature_dim).
+            """
+            # Move the image to the model device
+            image_proc = images.to(model_device)
+            # permute the image to (num_envs, channel, height, width)
+            image_proc = image_proc.permute(0, 3, 1, 2).float() / 255.0
+            # Normalize the image
+            image_proc = (image_proc - mean) / std
+
+            # Taken from Transformers; inference converted to be GPU only
+            features = model.backbone.model(pixel_values=image_proc, interpolate_pos_encoding=True)
+            return features.last_hidden_state[:, 1:]
+
+        return {"model": _load_model, "inference": _inference}
+
+    def _prepare_resnet_model(self, model_name: str, model_device: str) -> dict:
+        """Prepare the ResNet model for inference.
+
+        Args:
+            model_name: The name of the ResNet model to prepare.
+            model_device: The device to store and infer the model on.
+
+        Returns:
+            A dictionary containing the model and inference functions.
+        """
+        from torchvision import models
+
+        def _load_model() -> torch.nn.Module:
+            """Load the ResNet model."""
+            # map the model name to the weights
+            resnet_weights = {
+                "resnet18": "ResNet18_Weights.IMAGENET1K_V1",
+                "resnet34": "ResNet34_Weights.IMAGENET1K_V1",
+                "resnet50": "ResNet50_Weights.IMAGENET1K_V1",
+                "resnet101": "ResNet101_Weights.IMAGENET1K_V1",
+            }
+
+            # load the model
+            model = getattr(models, model_name)(weights=resnet_weights[model_name]).eval()
+            return model.to(model_device)
+
+        # ImageNet normalization statistics, created once instead of on every inference call
+        mean = torch.tensor([0.485, 0.456, 0.406], device=model_device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=model_device).view(1, 3, 1, 1)
+
+        def _inference(model, images: torch.Tensor) -> torch.Tensor:
+            """Inference the ResNet model.
+
+            Args:
+                model: The ResNet model.
+                images: The preprocessed image tensor. Shape is (num_envs, channel, height, width).
+
+            Returns:
+                The extracted features tensor. Shape is (num_envs, feature_dim).
+            """
+            # move the image to the model device
+            image_proc = images.to(model_device)
+            # permute the image to (num_envs, channel, height, width)
+            image_proc = image_proc.permute(0, 3, 1, 2).float() / 255.0
+            # normalize the image
+            image_proc = (image_proc - mean) / std
+
+            # forward the image through the model
+            return model(image_proc)
+
+        # return the model, preprocess and inference functions
+        return {"model": _load_model, "inference": _inference}
+
+
+@deprecated(
+    "mdp.stacked_image is deprecated; use the frame_stack parameter of image_rgb, image_depth, image_normals"
+    " or image_segmentation instead. mdp.stacked_image will be removed in a future release."
+)
+class stacked_image(ManagerTermBase):
+    """Channel-stacked observation of the last ``frame_stack`` camera frames.
+
+    .. deprecated::
+        Use the ``frame_stack`` parameter of :class:`image_rgb`, :class:`image_depth`,
+        :class:`image_normals` or :class:`image_segmentation`.
+
+    Args:
+        sensor_cfg: The sensor configuration to poll. Defaults to SceneEntityCfg("tiled_camera").
+        data_type: The sensor data type. Defaults to "rgb".
+        frame_stack: Number of frames to stack along the channel dim. Must be >= 1.
+            Defaults to 1 (single-frame passthrough).
+        convert_perspective_to_orthogonal: Whether to orthogonalize perspective depth images.
+            Used only when ``data_type == "distance_to_camera"``. Defaults to False.
+        normalize: Whether to normalize the images with
+            :func:`~isaaclab.utils.images.normalize_camera_image`. Defaults to True.
+
+    Returns:
+        Stacked image tensor. Shape is ``(num_envs, H, W, frame_stack * C)`` where the first
+        ``C`` channels are the oldest frame and the last ``C`` channels are the newest.
+    """
+
+    def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        self._frames = CameraFrameStack(env.num_envs, env.device, frame_stack=cfg.params["frame_stack"])
+
+    def reset(self, env_ids: torch.Tensor | None = None):
+        self._frames.reset(env_ids)
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        sensor_cfg: SceneEntityCfg = SceneEntityCfg("tiled_camera"),
+        data_type: str = "rgb",
+        frame_stack: int = 1,
+        convert_perspective_to_orthogonal: bool = False,
+        normalize: bool = True,
+    ) -> torch.Tensor:
+        images = _read_camera_output(env, sensor_cfg, data_type, convert_perspective_to_orthogonal)
+        return self._frames(
+            images, functools.partial(normalize_camera_image, data_type=data_type) if normalize else None
+        )
+
+
+"""
+Actions.
+"""
+
+
+@generic_io_descriptor(dtype=torch.float32, observation_type="Action", on_inspect=[record_shape])
+def last_action(env: ManagerBasedEnv, action_name: str | None = None) -> torch.Tensor:
+    """The last input action to the environment.
+
+    The name of the action term for which the action is required. If None, the
+    entire action tensor is returned.
+    """
+    if action_name is None:
+        return env.action_manager.action
+    else:
+        return env.action_manager.get_term(action_name).raw_actions
+
+
+"""
+Commands.
+"""
+
+
+@generic_io_descriptor(dtype=torch.float32, observation_type="Command", on_inspect=[record_shape])
+def generated_commands(env: ManagerBasedRLEnv, command_name: str | None = None) -> torch.Tensor:
+    """The generated command from command term in the command manager with the given name."""
+    return env.command_manager.get_command(command_name)
+
+
+"""
+Time.
+"""
+
+
+def current_time_s(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """The current time in the episode (in seconds)."""
+    return env.episode_length_buf.unsqueeze(1) * env.step_dt
+
+
+def remaining_time_s(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """The maximum time remaining in the episode (in seconds)."""
+    return env.max_episode_length_s - env.episode_length_buf.unsqueeze(1) * env.step_dt

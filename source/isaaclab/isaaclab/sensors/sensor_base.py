@@ -1,0 +1,566 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Base class for sensors.
+
+This class defines an interface for sensors similar to how the :class:`isaaclab.assets.AssetBase` class works.
+Each sensor class should inherit from this class and implement the abstract methods.
+"""
+
+from __future__ import annotations
+
+import inspect
+import logging
+import sys
+import weakref
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any
+
+import warp as wp
+
+from isaaclab.utils import clone, validate
+
+from .. import sim as sim_utils
+from ..cloner import path as cloner_path
+from ..cloner.cloner_cfg import expand_env_regex_ns
+from ..physics import PhysicsEvent, PhysicsManager
+from ..sim.utils.queries import get_first_matching_ancestor_prim
+from ..sim.utils.transforms import resolve_prim_pose
+from ..utils import index_fill_
+from .kernels import invalidate_buffers_kernel, reset_envs_kernel, update_outdated_envs_kernel, update_timestamp_kernel
+
+if TYPE_CHECKING:
+    from .sensor_base_cfg import SensorBaseCfg
+
+logger = logging.getLogger(__name__)
+
+
+class SensorBase(ABC):
+    """The base class for implementing a sensor.
+
+    The implementation is based on lazy evaluation. Sensor buffers are refreshed through the
+    :attr:`data` property, by setting ``force_recompute=True`` in :meth:`update`, or by calling
+    :meth:`update_batch`. This avoids unnecessary computation when sensor data is not used.
+
+    The sensor is updated at the specified update period. If the update period is zero, then the
+    sensor is updated at every simulation step.
+
+    This base owns environment rows and their clocks. Backend sensors must validate native binding
+    coverage rather than resize those rows when some environments have no matching sensor body.
+    Reset leaves cleared sensor outputs valid. Derived-query sensors explicitly invalidate their
+    cached results after initialization or reset. Backend kernels consume the resulting masks;
+    they must not repeat reset-readiness checks or introduce class-level reset policies.
+    """
+
+    def __init__(self, cfg: SensorBaseCfg):
+        """Initialize the sensor class.
+
+        Args:
+            cfg: The configuration parameters for the sensor.
+        """
+        # start with unset callback handles so cleanup is safe if construction fails part way
+        self._initialize_handle = None
+        self._invalidate_initialize_handle = None
+        self._prim_deletion_handle = None
+        # handle for debug visualization (this is set to a valid handle inside set_debug_vis)
+        self._debug_vis_handle = None
+
+        validate(cfg)
+        cfg.prim_path = expand_env_regex_ns(cfg.prim_path)
+        self.cfg = clone(cfg)
+        self._is_initialized = False
+        self._is_visualizing = False
+        self.stage = sim_utils.get_current_stage()
+
+        self._register_callbacks()
+        self.set_debug_vis(self.cfg.debug_vis)
+
+    def __del__(self, _sys=sys):
+        """Unsubscribe from the callbacks.
+
+        Skips cleanup during interpreter shutdown. ``sys`` is bound as a default argument so it
+        survives module teardown. Running :meth:`_clear_callbacks` after import machinery is gone
+        can lazy-import ``isaaclab.sim`` and raise ``ImportError: sys.meta_path is None``, which
+        then masks the exception that actually aborted the process.
+        """
+        if _sys.is_finalizing() or _sys.meta_path is None:
+            return
+        self._clear_callbacks()
+
+    """
+    Properties
+    """
+
+    @property
+    def is_initialized(self) -> bool:
+        """Whether the sensor is initialized.
+
+        Returns True if the sensor is initialized, False otherwise.
+        """
+        return self._is_initialized
+
+    @property
+    def num_instances(self) -> int:
+        """Number of instances of the sensor.
+
+        This is equal to the number of sensors per environment multiplied by the number of environments.
+        """
+        return self._num_envs
+
+    @property
+    def device(self) -> str:
+        """Memory device for computation."""
+        return self._device
+
+    @property
+    def supports_batch_update(self) -> bool:
+        """Whether eager buffer refreshes can share work through :meth:`update_batch`.
+
+        Defaults to False. Sensors may opt in and implement ``_update_buffers_batch_impl``
+        to share work with sensors that use the same batch implementation.
+        """
+        return False
+
+    @property
+    @abstractmethod
+    def data(self) -> Any:
+        """Data from the sensor.
+
+        This property is only updated when the user tries to access the data. This is done to avoid
+        unnecessary computation when the sensor data is not used.
+
+        For updating the sensor when this property is accessed, you can use the following
+        code snippet in your sensor implementation:
+
+        .. code-block:: python
+
+            # update sensors if needed
+            self._update_outdated_buffers()
+            # return the data (where `_data` is the data for the sensor)
+            return self._data
+        """
+        raise NotImplementedError
+
+    @property
+    def has_debug_vis_implementation(self) -> bool:
+        """Whether the sensor has a debug visualization implemented."""
+        # check if function raises NotImplementedError
+        source_code = inspect.getsource(self._set_debug_vis_impl)
+        return "NotImplementedError" not in source_code
+
+    """
+    Operations
+    """
+
+    def set_debug_vis(self, debug_vis: bool) -> bool:
+        """Sets whether to visualize the sensor data.
+
+        Args:
+            debug_vis: Whether to visualize the sensor data.
+
+        Returns:
+            Whether the debug visualization was successfully set. False if the sensor
+            does not support debug visualization.
+        """
+        # check if debug visualization is supported
+        if not self.has_debug_vis_implementation:
+            return False
+        # toggle debug visualization objects
+        self._set_debug_vis_impl(debug_vis)
+        # toggle debug visualization flag
+        self._is_visualizing = debug_vis
+        # toggle debug visualization handles
+        if debug_vis:
+            # create a subscriber for the post update event if it doesn't exist
+            if self._debug_vis_handle is None:
+                sim_ctx = sim_utils.SimulationContext.instance()
+                if sim_ctx is not None:
+                    self._debug_vis_handle = sim_ctx.vis_marker_registry.add_debug_vis_callback(self)
+        else:
+            self._clear_debug_vis_handle()
+        return True
+
+    def reset(self, env_ids: Sequence[int] | None = None, env_mask: wp.array | None = None) -> None:
+        """Reset timing for the cleared outputs established by the sensor's reset implementation.
+
+        Reset values remain cached until the next positive-time update. Subclasses that retain
+        derived results instead of clearing them must invalidate those results explicitly.
+
+        Args:
+            env_ids: The environment indices to reset. Defaults to None, in which case all
+                environments are reset.
+            env_mask: A boolean warp array indicating which environments to reset. If provided,
+                takes priority over ``env_ids``. Defaults to None.
+        """
+        env_mask = self._resolve_indices_and_mask(env_ids, env_mask)
+        wp.launch(
+            reset_envs_kernel,
+            dim=self._num_envs,
+            inputs=[
+                env_mask,
+                self._is_outdated,
+                self._timestamp,
+                self._timestamp_last_update,
+                self._elapsed_since_update,
+            ],
+            device=self._device,
+        )
+        if env_mask is self._ALL_ENV_MASK:
+            self._data_dirty = False
+
+    def update(self, dt: float, force_recompute: bool = False):
+        """Advance the sampling clock and optionally refresh due data."""
+        # Skip update if sensor is not initialized
+        if not self._is_initialized:
+            return
+        self._data_dirty |= dt > 0.0
+        # Update the timestamp for the sensors
+        wp.launch(
+            update_timestamp_kernel,
+            dim=self._num_envs,
+            inputs=[
+                self._is_outdated,
+                self._timestamp,
+                self._timestamp_last_update,
+                self._elapsed_since_update,
+                dt,
+                self.cfg.update_period - 1e-6,
+            ],
+            device=self._device,
+        )
+        # Update the buffers; debug visualization refreshes lazily from its callback.
+        if force_recompute:
+            self._update_outdated_buffers()
+
+    @staticmethod
+    def update_batch(sensors: Sequence[SensorBase], dt: float) -> None:
+        """Advance batch-capable sensors and eagerly refresh their data in compatible groups.
+
+        All sensors must report :attr:`supports_batch_update` as True. Calls each sensor's
+        :meth:`update` once in input order with ``force_recompute=False``, then processes
+        pending buffers through their shared ``_update_buffers_batch_impl`` static methods.
+        Use this method instead of calling :meth:`update` separately for the same time step.
+
+        Uninitialized sensors and sensors already refreshed during the update loop are excluded
+        from batch processing. Each batch is marked updated only after its implementation
+        returns successfully.
+
+        Args:
+            sensors: Batch-capable sensors to update, each appearing once. An empty sequence
+                performs no work.
+            dt: Time elapsed since the previous sensor update [s].
+
+        Raises:
+            ValueError: If any sensor does not support batch updates. No sensors are advanced
+                in this case.
+        """
+        if any(not sensor.supports_batch_update for sensor in sensors):
+            raise ValueError("Batch updates require sensors with supports_batch_update=True.")
+        for sensor in sensors:
+            sensor.update(dt, force_recompute=False)
+        SensorBase._process_batch(sensors)
+
+    """
+    Implementation specific.
+    """
+
+    @abstractmethod
+    def _initialize_impl(self):
+        """Initializes the sensor-related handles and internal buffers."""
+        # Obtain Simulation Context
+        sim = self._sim
+        # Obtain device and backend
+        self._device = sim.device
+        self._backend = sim.backend
+        self._sim_physics_dt = sim.get_physics_dt()
+        # Native clones need not have corresponding USD prims.
+        clone_plan = sim.get_clone_plan()
+        self._is_global = (
+            clone_plan is not None and cloner_path.match(self.cfg.prim_path, clone_plan.env_template) is None
+        )
+        if clone_plan is not None and not self._is_global:
+            self._num_envs = len(clone_plan.topology.world_prototype_layout)
+        else:
+            env_prim_path_expr = "/".join(sim_utils.split_path_expr(self.cfg.prim_path)[:-1])
+            self._num_envs = len(sim_utils.find_matching_prims(env_prim_path_expr))
+        # Create warp env mask arrays for "all envs" cases and resets.
+        # Torch views share these Warp arrays' storage; scalar indexed writes use index_fill_ to avoid a sync.
+        self._ALL_ENV_MASK = wp.ones((self._num_envs), dtype=wp.bool, device=self._device)
+        self._reset_mask = wp.zeros((self._num_envs), dtype=wp.bool, device=self._device)
+        self._reset_mask_torch = wp.to_torch(self._reset_mask)
+        self._create_timing_buffers()
+        self._data_dirty = False
+
+        # Initialize debug visualization handle
+        if self._debug_vis_handle is None:
+            # set initial state of debug visualization
+            self.set_debug_vis(self.cfg.debug_vis)
+
+    @abstractmethod
+    def _update_buffers_impl(self, env_mask: wp.array):
+        """Fills the sensor data for provided environment ids.
+
+        This function does not perform any time-based checks and directly fills the data into the
+        data container.
+
+        Args:
+            env_mask: The mask of the environments that are ready to capture.
+        """
+        raise NotImplementedError
+
+    @staticmethod
+    def _update_buffers_batch_impl(sensors: Sequence[SensorBase]) -> None:
+        """Fill buffers for initialized sensors that share this batch implementation.
+
+        Each sensor's ``_is_outdated`` mask selects its due environments and may be empty.
+        Implementations must fill the requested buffers before returning and leave timestamp
+        and generation bookkeeping to the caller. The default implementation
+        calls each sensor's ``_update_buffers_impl`` individually.
+
+        Args:
+            sensors: Sensors whose buffers need checking, all using this static method.
+        """
+        for sensor in sensors:
+            sensor._update_buffers_impl(sensor._is_outdated)
+
+    def _set_debug_vis_impl(self, debug_vis: bool):
+        """Set debug visualization into visualization objects.
+
+        This function is responsible for creating the visualization objects if they don't exist
+        and input ``debug_vis`` is True. If the visualization objects exist, the function should
+        set their visibility into the stage.
+        """
+        raise NotImplementedError(f"Debug visualization is not implemented for {self.__class__.__name__}.")
+
+    def _debug_vis_callback(self, event):
+        """Callback for debug visualization.
+
+        This function calls the visualization objects and sets the data to visualize into them.
+        Sensor buffers are refreshed lazily, so implementations must refresh outdated buffers
+        (for example through :attr:`data`) before reading internal data.
+        """
+        raise NotImplementedError(f"Debug visualization is not implemented for {self.__class__.__name__}.")
+
+    """
+    Internal simulation callbacks.
+    """
+
+    def _register_callbacks(self):
+        """Registers physics lifecycle callbacks via the current backend's physics manager."""
+        self._sim = sim_utils.SimulationContext.instance()
+        physics_mgr = self._backend_manager = self._sim.backend_manager
+
+        obj_ref = weakref.proxy(self)
+
+        def _invoke(callback_name, event):
+            getattr(obj_ref, callback_name)(event)
+
+        # Backend-agnostic: PHYSICS_READY (init) and STOP (invalidate)
+        self._initialize_handle = physics_mgr.register_callback(
+            lambda payload: PhysicsManager.safe_callback_invoke(
+                _invoke, "_initialize_callback", payload, backend_manager=physics_mgr
+            ),
+            PhysicsEvent.PHYSICS_READY,
+            order=10,
+        )
+        self._invalidate_initialize_handle = physics_mgr.register_callback(
+            lambda payload: PhysicsManager.safe_callback_invoke(
+                _invoke, "_invalidate_initialize_callback", payload, backend_manager=physics_mgr
+            ),
+            PhysicsEvent.STOP,
+            order=10,
+        )
+        # Optional: prim deletion (only supported by the Kit PhysX backend; OVPhysX does not expose
+        # ``IsaacEvents``).
+        self._prim_deletion_handle = None
+        if physics_mgr.backend_name == "physx":
+            from isaaclab_physx.physics import IsaacEvents  # noqa: PLC0415
+
+            self._prim_deletion_handle = physics_mgr.register_callback(
+                lambda event: PhysicsManager.safe_callback_invoke(
+                    _invoke, "_on_prim_deletion", event, backend_manager=physics_mgr
+                ),
+                IsaacEvents.PRIM_DELETION,
+            )
+
+    def _initialize_callback(self, event):
+        """Initializes the scene elements.
+
+        .. note::
+            Physics handles are only valid once the simulation is ready. This callback runs when
+            :attr:`PhysicsEvent.PHYSICS_READY` is dispatched by the current backend.
+        """
+        if not self._is_initialized:
+            self._initialize_impl()
+            self._is_initialized = True
+
+    def _invalidate_initialize_callback(self, event):
+        """Invalidates the scene elements."""
+        self._is_initialized = False
+        self._clear_debug_vis_handle()
+
+    def _on_prim_deletion(self, event) -> None:
+        """Invalidates and deletes the callbacks when the prim is deleted.
+
+        Args:
+            event: The prim deletion event containing the prim path in payload.
+
+        Note:
+            This function is called when the prim is deleted.
+        """
+        prim_path = event.payload["prim_path"]
+        if prim_path == "/" or sim_utils.matches_path_expr_prefix(self.cfg.prim_path, prim_path):
+            self._clear_callbacks()
+
+    def _clear_callbacks(self) -> None:
+        """Clears the callbacks."""
+        if self._initialize_handle is not None:
+            self._initialize_handle.deregister()
+            self._initialize_handle = None
+        if self._invalidate_initialize_handle is not None:
+            self._invalidate_initialize_handle.deregister()
+            self._invalidate_initialize_handle = None
+        if self._prim_deletion_handle is not None:
+            self._prim_deletion_handle.deregister()
+            self._prim_deletion_handle = None
+        # Clear debug visualization
+        self._clear_debug_vis_handle()
+
+    def _clear_debug_vis_handle(self) -> None:
+        """Removes the debug visualization subscriber, if any."""
+        sim_ctx = sim_utils.SimulationContext.instance()
+        if sim_ctx is not None:
+            sim_ctx.vis_marker_registry.clear_debug_vis_callback(self)
+        else:
+            self._debug_vis_handle = None
+
+    """
+    Helper functions.
+    """
+
+    def _check_env_count(self, count: int, prim_path: str, instances_per_env: int = 1) -> None:
+        """Reject native bindings that cannot be indexed with the scene's environment masks."""
+        if count != self._num_envs * instances_per_env:
+            raise RuntimeError(
+                f"{type(self).__name__} at '{self.cfg.prim_path}' requires {instances_per_env} instance(s) in each"
+                f" of {self._num_envs} environments; '{prim_path}' matched {count} instances."
+            )
+
+    def _create_timing_buffers(self) -> None:
+        """Allocate the shared per-environment flags and clocks used to schedule captures."""
+        # timestamp and outdated flags
+        self._is_outdated = wp.zeros(self._num_envs, dtype=wp.bool, device=self._device)
+        self._timestamp = wp.zeros(self._num_envs, dtype=wp.float32, device=self._device)
+        # A negative timestamp means no backend sample has been read since initialization/reset.
+        self._timestamp_last_update = wp.full(self._num_envs, -1.0, dtype=wp.float32, device=self._device)
+        self._elapsed_since_update = wp.zeros(self._num_envs, dtype=wp.float64, device=self._device)
+
+    def _invalidate_buffers(self, env_mask: wp.array | None = None) -> None:
+        """Invalidate selected results without advancing sampling clocks; None selects all environments."""
+        if env_mask is None or env_mask is self._ALL_ENV_MASK:
+            self._is_outdated.fill_(True)
+        else:
+            wp.launch(
+                invalidate_buffers_kernel, dim=self._num_envs, inputs=[env_mask, self._is_outdated], device=self._device
+            )
+        self._data_dirty = True
+
+    def _update_outdated_buffers(self) -> None:
+        """Fills the sensor data for the outdated sensors."""
+        if not self._data_dirty:
+            return
+        self._update_buffers_impl(self._is_outdated)
+        self._mark_buffers_updated()
+
+    def _mark_buffers_updated(self) -> None:
+        """Commit capture timestamps after the sensor's output buffers have been filled."""
+        # update timestamps and clear outdated flags
+        wp.launch(
+            update_outdated_envs_kernel,
+            dim=self._num_envs,
+            inputs=[self._is_outdated, self._timestamp, self._timestamp_last_update, self._elapsed_since_update],
+            device=self._device,
+        )
+        self._data_dirty = False
+
+    @staticmethod
+    def _process_batch(sensors: Sequence[SensorBase]) -> None:
+        """Refresh pending buffers for batch-capable sensors whose timing has already advanced."""
+        # A later sensor's update may already have refreshed an earlier sensor's data.
+        groups: dict[Callable[[Sequence[SensorBase]], None], list[SensorBase]] = {}
+        for sensor in sensors:
+            if not sensor.is_initialized or not sensor._data_dirty:
+                continue
+            batch_impl = type(sensor)._update_buffers_batch_impl
+            groups.setdefault(batch_impl, []).append(sensor)
+
+        for batch_impl, group in groups.items():
+            batch_impl(group)
+            for sensor in group:
+                sensor._mark_buffers_updated()
+
+    def _resolve_indices_and_mask(
+        self, env_ids: Sequence[int] | None = None, env_mask: wp.array | None = None
+    ) -> wp.array:
+        """Resolve environment indices to a warp array and mask."""
+        if (env_ids is None or env_ids == slice(None)) and env_mask is None:
+            return self._ALL_ENV_MASK
+        elif env_mask is not None:
+            return env_mask
+        else:
+            self._reset_mask.zero_()
+            index_fill_(self._reset_mask_torch, env_ids, True)
+            return self._reset_mask
+
+    def _resolve_rigid_body_ancestor_expr(
+        self,
+    ) -> tuple[str, tuple[float, float, float] | None, tuple[float, float, float, float] | None]:
+        """Resolve the rigid-body ancestor view expression and the sensor-to-body offset.
+
+        The sensor's :attr:`SensorBaseCfg.prim_path` may point to any frame
+        inside the asset. To create a physics view, this helper walks ancestors
+        from that prim until it finds one with ``UsdPhysics.RigidBodyAPI``,
+        builds the corresponding destination-side expression, and computes the
+        fixed transform from that body to the configured sensor frame.
+
+        The returned expression may still contain regex-style wildcards (e.g.
+        ``.*``); callers are responsible for converting to glob form for their
+        physics view (e.g. via :func:`~isaaclab.sim.utils.path_expr_to_glob`).
+
+        Returns:
+            A tuple of:
+
+            * ``rigid_parent_expr``: destination-side view expression that
+              matches the rigid-body ancestor across envs.
+            * ``fixed_pos_b``: sensor-relative-to-body translation [m] (xyz),
+              or ``None`` when the sensor is mounted directly at the body
+              origin.
+            * ``fixed_quat_b``: sensor-relative-to-body rotation as a
+              quaternion ``(x, y, z, w)``, or ``None`` when the sensor is
+              mounted directly at the body origin.
+        """
+        prim, target_expr = sim_utils.resolve_matching_prims_from_source(self.cfg.prim_path)[0]
+        from pxr import UsdPhysics  # noqa: PLC0415
+
+        ancestor_prim = get_first_matching_ancestor_prim(
+            prim.GetPath(), predicate=lambda _prim: _prim.HasAPI(UsdPhysics.RigidBodyAPI)
+        )
+        if ancestor_prim is None:
+            raise RuntimeError(f"Failed to find a rigid body ancestor prim at path expression: {self.cfg.prim_path}")
+
+        if ancestor_prim == prim:
+            return target_expr, None, None
+
+        relative_path = prim.GetPath().MakeRelativePath(ancestor_prim.GetPath()).pathString
+        suffix = "/" + relative_path
+        if not target_expr.endswith(suffix):
+            raise RuntimeError(
+                f"Failed to build rigid body ancestor expression: target expression {target_expr!r} does not end "
+                f"with relative path {relative_path!r}."
+            )
+        rigid_parent_expr = target_expr[: -len(suffix)]
+        fixed_pos_b, fixed_quat_b = resolve_prim_pose(prim, ancestor_prim)
+        return rigid_parent_expr, fixed_pos_b, fixed_quat_b

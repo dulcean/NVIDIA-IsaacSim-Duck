@@ -1,0 +1,437 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+from __future__ import annotations
+
+import inspect
+import weakref
+from abc import ABC, abstractmethod
+from collections import OrderedDict
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any, Literal
+
+import torch
+import warp as wp
+
+from .. import sim as sim_utils
+from ..physics import PhysicsEvent, PhysicsManager
+from ..sim.simulation_context import SimulationContext
+from ..utils.warp import ProxyArray
+from .asset import Asset
+
+if TYPE_CHECKING:
+    from .asset_base_cfg import AssetBaseCfg
+
+
+_SELECTOR_CACHE_CAPACITY = 128
+
+
+class _AssetSelectorCache:
+    """Per-asset LRU cache for device-local finder selectors."""
+
+    def __init__(self, capacity: int = _SELECTOR_CACHE_CAPACITY):
+        self._capacity = capacity
+        self._entries: OrderedDict[tuple[str, tuple[int, ...]], ProxyArray] = OrderedDict()
+
+    def get(self, domain: str, indices: Sequence[int], device: str) -> ProxyArray:
+        """Return the cached Warp ``int32`` selector for an ordered index sequence."""
+        key = (domain, tuple(int(index) for index in indices))
+        selector = self._entries.pop(key, None)
+        if selector is None:
+            selector = ProxyArray(wp.array(key[1], dtype=wp.int32, device=device))
+        self._entries[key] = selector
+        if len(self._entries) > self._capacity:
+            self._entries.popitem(last=False)
+        return selector
+
+    def clear(self) -> None:
+        """Release all cached selectors."""
+        self._entries.clear()
+
+
+class AssetBase(Asset, ABC):
+    """The base interface class for assets.
+
+    An asset corresponds to any physics-enabled object that can be spawned in the simulation. These include
+    rigid objects, articulated objects, deformable objects etc. The core functionality of an asset is to
+    provide a set of buffers that can be used to interact with the simulator. The buffers are updated
+    by the asset class and can be written into the simulator using the their respective ``write`` methods.
+    This allows a convenient way to perform post-processing operations on the buffers before writing them
+    into the simulator and obtaining the corresponding simulation results.
+
+    The class extends :class:`Asset` with physics handles and runtime data buffers. Construction first authors
+    the asset and then registers callbacks that initialize its runtime view.
+
+    Unlike backend-specific interfaces (e.g. Isaac Sim PhysX) where one usually needs to call
+    initialize explicitly, the asset class automatically initializes and invalidates physics
+    handles when the simulation is ready or stopped. This is done by registering callbacks
+    for the physics lifecycle events (:attr:`PhysicsEvent.PHYSICS_READY`, :attr:`PhysicsEvent.STOP`).
+
+    Additionally, the class registers a callback for debug visualization of the asset if a debug visualization
+    is implemented in the asset class. This can be enabled by setting the :attr:`AssetBaseCfg.debug_vis` attribute
+    to True. The debug visualization is implemented through the :meth:`_set_debug_vis_impl` and
+    :meth:`_debug_vis_callback` methods.
+    """
+
+    _check_shapes: bool = __debug__
+    """Class-level default for shape validation. Overridden per-instance in ``__init__``."""
+
+    def __init__(self, cfg: AssetBaseCfg):
+        """Initialize the asset base.
+
+        Args:
+            cfg: The configuration class for the asset.
+
+        """
+        super().__init__(cfg)
+        # Resolve shape-check flag once: True means checks are active.
+        # cfg.disable_shape_checks: None -> follow __debug__
+        # True -> force disable checks; False -> force enable checks.
+        if self.cfg.disable_shape_checks is None:
+            self._check_shapes = __debug__
+        else:
+            self._check_shapes = not self.cfg.disable_shape_checks
+        self._is_initialized = False
+        self._register_callbacks()
+
+        # add handle for debug visualization (this is set to a valid handle inside set_debug_vis)
+        self._debug_vis_handle = None
+        self.set_debug_vis(self.cfg.debug_vis)
+
+    def __del__(self):
+        """Unsubscribe from the callbacks."""
+        self._clear_callbacks()
+
+    """
+    Properties
+    """
+
+    @property
+    def is_initialized(self) -> bool:
+        """Whether the asset is initialized.
+
+        Returns True if the asset is initialized, False otherwise.
+        """
+        return self._is_initialized
+
+    @property
+    @abstractmethod
+    def num_instances(self) -> int:
+        """Number of instances of the asset.
+
+        This is equal to the number of asset instances per environment multiplied by the number of environments.
+        """
+        raise NotImplementedError
+
+    @property
+    def device(self) -> str:
+        """Memory device for computation."""
+        return self._device
+
+    @property
+    @abstractmethod
+    def data(self) -> Any:
+        """Data related to the asset."""
+        raise NotImplementedError
+
+    @property
+    def has_debug_vis_implementation(self) -> bool:
+        """Whether the asset has a debug visualization implemented."""
+        # check if function raises NotImplementedError
+        source_code = inspect.getsource(self._set_debug_vis_impl)
+        return "NotImplementedError" not in source_code
+
+    """
+    Operations.
+    """
+
+    def set_debug_vis(self, debug_vis: bool) -> bool:
+        """Sets whether to visualize the asset data.
+
+        Args:
+            debug_vis: Whether to visualize the asset data.
+
+        Returns:
+            Whether the debug visualization was successfully set. False if the asset
+            does not support debug visualization.
+        """
+        # check if debug visualization is supported
+        if not self.has_debug_vis_implementation:
+            return False
+        # toggle debug visualization objects
+        self._set_debug_vis_impl(debug_vis)
+        # toggle debug visualization handles (Kit/omni only for PhysX backend)
+        if debug_vis:
+            sim_ctx = SimulationContext.instance()
+            if self._debug_vis_handle is None and sim_ctx is not None:
+                self._debug_vis_handle = sim_ctx.vis_marker_registry.add_debug_vis_callback(self)
+        else:
+            self._clear_debug_vis_handle()
+        return True
+
+    def _resolve_finder_indices(
+        self,
+        indices: Sequence[int],
+        *,
+        proxy_indices: Sequence[int] | None = None,
+        domain: str,
+        as_proxy: bool = False,
+        legacy_type: Literal["list", "tensor"],
+    ) -> list[int] | torch.Tensor | ProxyArray:
+        """Return cached proxy indices or the legacy container."""
+        if not isinstance(as_proxy, bool):
+            raise TypeError(f"as_proxy must be a bool, got {type(as_proxy).__name__}.")
+
+        normalized_indices = tuple(int(index) for index in indices)
+        if as_proxy:
+            normalized_proxy_indices = normalized_indices if proxy_indices is None else tuple(map(int, proxy_indices))
+            selector_cache = getattr(self, "_selector_cache", None)
+            if selector_cache is None:
+                selector_cache = _AssetSelectorCache()
+                self._selector_cache = selector_cache
+            return selector_cache.get(domain, normalized_proxy_indices, self.device)
+
+        if legacy_type == "list":
+            return list(normalized_indices)
+        return torch.tensor(normalized_indices, dtype=torch.int32, device=self.device)
+
+    def _clear_selector_cache(self) -> None:
+        """Release all cached finder selectors owned by this asset."""
+        selector_cache = getattr(self, "_selector_cache", None)
+        if selector_cache is not None:
+            selector_cache.clear()
+
+    def _clear_debug_vis_handle(self) -> None:
+        """Unregister the debug visualization callback, or drop the handle when no simulation context exists."""
+        sim_ctx = SimulationContext.instance()
+        if sim_ctx is not None:
+            sim_ctx.vis_marker_registry.clear_debug_vis_callback(self)
+        else:
+            self._debug_vis_handle = None
+
+    @abstractmethod
+    def reset(self, env_ids: Sequence[int] | None = None):
+        """Resets all internal buffers of selected environments.
+
+        Args:
+            env_ids: The indices of the object to reset. Defaults to None (all instances).
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def write_data_to_sim(self):
+        """Writes data to the simulator."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def update(self, dt: float):
+        """Update the internal buffers.
+
+        The time step ``dt`` is used to compute numerical derivatives of quantities such as joint
+        accelerations which are not provided by the simulator.
+
+        Args:
+            dt: The amount of time passed from last ``update`` call.
+        """
+        raise NotImplementedError
+
+    """
+    Validation.
+    """
+
+    # Mapping from warp dtype to the trailing dimensions that a torch.Tensor
+    # would have for the same data.  Subclasses may extend this (e.g. custom
+    # ``vec6f`` in deformable objects) by updating the dict in their ``__init__``.
+    _DTYPE_TO_TORCH_TRAILING_DIMS: dict[type, tuple[int, ...]] = {
+        wp.float32: (),
+        wp.int32: (),
+        wp.vec2f: (2,),
+        wp.vec3f: (3,),
+        wp.vec4f: (4,),
+        wp.transformf: (7,),
+        wp.spatial_vectorf: (6,),
+    }
+    _SHAPE_AXIS_LIMITS = (("env_ids", "num_instances"),)
+
+    def assert_shape_and_dtype(
+        self,
+        tensor: float | torch.Tensor | wp.array,
+        shape: tuple[int, ...],
+        dtype: type,
+        name: str = "",
+        *,
+        axis_sizes: tuple[int, ...] | None = None,
+    ) -> None:
+        """Assert the shape and dtype of a tensor or warp array.
+
+        Controlled by :attr:`AssetBaseCfg.disable_shape_checks`. When checks are
+        disabled this method is a no-op.
+
+        Args:
+            tensor: The tensor or warp array to assert the shape of. Floats are skipped.
+            shape: The expected leading dimensions (e.g. ``(num_envs, num_joints)``).
+            dtype: The expected warp dtype.
+            name: Optional parameter name for error messages.
+            axis_sizes: Optional selector sizes. Defaults to the expected leading dimensions.
+        """
+        if self._check_shapes:
+            cls = type(self).__name__
+            prefix = f"{cls}: '{name}' " if name else f"{cls}: "
+            for size, (axis_name, limit_name) in zip(axis_sizes or shape, self._SHAPE_AXIS_LIMITS):
+                limit = getattr(self, limit_name)
+                assert size <= limit, f"{prefix}{axis_name} size exceeds asset dimension: {size} > {limit}"
+            if isinstance(tensor, (int, float)):
+                return
+            elif isinstance(tensor, wp.array):
+                assert tensor.dtype == dtype, f"{prefix}Dtype mismatch: {tensor.dtype} != {dtype}"
+                assert tensor.shape == shape, f"{prefix}Shape mismatch: {tensor.shape} != {shape}"
+            elif isinstance(tensor, torch.Tensor):
+                offset = self._DTYPE_TO_TORCH_TRAILING_DIMS.get(dtype)
+                if offset is None:
+                    raise ValueError(f"Unsupported dtype: {dtype}")
+                assert tensor.shape == (*shape, *offset), (
+                    f"{prefix}Shape mismatch: {tensor.shape} != {(*shape, *offset)}"
+                )
+
+    def assert_shape_and_dtype_mask(
+        self,
+        tensor: float | torch.Tensor | wp.array,
+        masks: tuple[wp.array, ...],
+        dtype: type,
+        name: str = "",
+        trailing_dims: tuple[int, ...] = (),
+    ) -> None:
+        """Assert the shape of a tensor or warp array against mask dimensions.
+
+        Mask-based write methods expect **full-sized** data — one element per entry in each mask
+        dimension, regardless of how many entries are ``True``. The expected leading shape is therefore
+        ``(mask_0.shape[0], mask_1.shape[0], ...)`` (i.e. the *total* size of each dimension, not the
+        number of selected entries).
+
+        Controlled by :attr:`AssetBaseCfg.disable_shape_checks`. When checks are
+        disabled this method is a no-op.
+
+        Args:
+            tensor: The tensor or warp array to assert the shape of. Floats are skipped.
+            masks: Tuple of mask arrays whose ``shape[0]`` dimensions form the expected leading shape.
+            dtype: The expected warp dtype.
+            name: Optional parameter name for error messages.
+            trailing_dims: Extra trailing dimensions to append (e.g. ``(9,)`` for inertias with ``wp.float32``).
+        """
+        if self._check_shapes:
+            shape = (*tuple(m.shape[0] for m in masks), *trailing_dims)
+            self.assert_shape_and_dtype(tensor, shape, dtype, name)
+
+    """
+    Implementation specific.
+    """
+
+    @abstractmethod
+    def _initialize_impl(self):
+        """Initializes the physics handles and internal buffers for the current backend."""
+        raise NotImplementedError
+
+    def _set_debug_vis_impl(self, debug_vis: bool):
+        """Set debug visualization into visualization objects.
+
+        This function is responsible for creating the visualization objects if they don't exist
+        and input ``debug_vis`` is True. If the visualization objects exist, the function should
+        set their visibility into the stage.
+        """
+        raise NotImplementedError(f"Debug visualization is not implemented for {self.__class__.__name__}.")
+
+    def _debug_vis_callback(self, event):
+        """Callback for debug visualization.
+
+        This function calls the visualization objects and sets the data to visualize into them.
+        """
+        raise NotImplementedError(f"Debug visualization is not implemented for {self.__class__.__name__}.")
+
+    """
+    Internal simulation callbacks.
+    """
+
+    def _register_callbacks(self):
+        """Registers physics lifecycle callbacks via the current backend's physics manager."""
+        self._sim = SimulationContext.instance()
+        physics_mgr = self._backend_manager = self._sim.backend_manager
+
+        # note: use weakref on callbacks to ensure that this object can be deleted when its destructor is called.
+        obj_ref = weakref.proxy(self)
+
+        def _invoke(callback_name, event):
+            getattr(obj_ref, callback_name)(event)
+
+        # Backend-agnostic: PHYSICS_READY (init) and STOP (invalidate)
+        self._initialize_handle = physics_mgr.register_callback(
+            lambda payload: PhysicsManager.safe_callback_invoke(
+                _invoke, "_initialize_callback", payload, backend_manager=physics_mgr
+            ),
+            PhysicsEvent.PHYSICS_READY,
+            order=10,
+        )
+        self._invalidate_initialize_handle = physics_mgr.register_callback(
+            lambda payload: PhysicsManager.safe_callback_invoke(
+                _invoke, "_invalidate_initialize_callback", payload, backend_manager=physics_mgr
+            ),
+            PhysicsEvent.STOP,
+            order=10,
+        )
+        # Optional: prim deletion (only supported by Kit PhysX backend, not ovphysx)
+        self._prim_deletion_handle = None
+        if physics_mgr.backend_name == "physx":
+            from isaaclab_physx.physics import IsaacEvents
+
+            self._prim_deletion_handle = physics_mgr.register_callback(
+                lambda event: PhysicsManager.safe_callback_invoke(
+                    _invoke, "_on_prim_deletion", event, backend_manager=physics_mgr
+                ),
+                IsaacEvents.PRIM_DELETION,
+            )
+
+    def _initialize_callback(self, event):
+        """Initializes the scene elements.
+
+        .. note::
+            Physics handles are only valid once the simulation is ready. This callback runs when
+            :attr:`PhysicsEvent.PHYSICS_READY` is dispatched by the current backend.
+        """
+        if not self._is_initialized:
+            self._backend = self._backend_manager.get_backend()
+            self._device = self._backend_manager.get_device()
+            self._initialize_impl()
+            self._is_initialized = True
+
+    def _invalidate_initialize_callback(self, event):
+        """Invalidates the scene elements."""
+        self._is_initialized = False
+        self._clear_selector_cache()
+        self._clear_debug_vis_handle()
+
+    def _on_prim_deletion(self, event) -> None:
+        """Invalidates and clears callbacks when the prim is deleted.
+
+        Only used when the backend supports prim deletion events (e.g. PhysX).
+        """
+        payload = getattr(event, "payload", event) if not isinstance(event, dict) else event
+        prim_path = payload.get("prim_path", "") if isinstance(payload, dict) else ""
+        if prim_path == "/":
+            self._clear_callbacks()
+            return
+        if sim_utils.matches_path_expr_prefix(self.cfg.prim_path, prim_path):
+            self._clear_callbacks()
+
+    def _clear_callbacks(self) -> None:
+        """Clears all registered callbacks."""
+        if getattr(self, "_initialize_handle", None) is not None:
+            self._initialize_handle.deregister()
+            self._initialize_handle = None
+        if getattr(self, "_invalidate_initialize_handle", None) is not None:
+            self._invalidate_initialize_handle.deregister()
+            self._invalidate_initialize_handle = None
+        if getattr(self, "_prim_deletion_handle", None) is not None:
+            self._prim_deletion_handle.deregister()
+            self._prim_deletion_handle = None
+        self._clear_debug_vis_handle()

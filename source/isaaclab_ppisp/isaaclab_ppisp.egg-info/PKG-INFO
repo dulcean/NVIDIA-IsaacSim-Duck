@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: isaaclab_ppisp
+Version: 0.3.2
+Summary: Extension providing a renderer-backend-agnostic PPISP pipeline that converts HDR scene-linear color to LDR RGBA at the end of a render tick.
+Author: Isaac Lab Project Developers
+Maintainer: Isaac Lab Project Developers
+License: BSD-3-Clause
+Project-URL: Homepage, https://github.com/isaac-sim/IsaacLab
+Project-URL: Repository, https://github.com/isaac-sim/IsaacLab
+Keywords: robotics,simulation,rendering,isp,ppisp
+Requires-Python: >=3.12
+Requires-Dist: isaaclab

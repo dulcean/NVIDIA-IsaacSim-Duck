@@ -1,0 +1,165 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""
+This script demonstrates the FrameTransformer sensor by visualizing the frames that it creates.
+
+.. code-block:: bash
+
+    # Usage
+    uv run python scripts/tutorials/04_sensors/run_frame_transformer.py --viz kit
+
+"""
+
+"""Parse the command-line arguments first."""
+
+import argparse
+
+from isaaclab.app import add_launcher_args, launch_simulation
+
+# add argparse arguments
+parser = argparse.ArgumentParser(
+    description="This script checks the FrameTransformer sensor by visualizing the frames that it creates."
+)
+add_launcher_args(parser)
+args_cli = parser.parse_args()
+
+"""Rest everything follows."""
+
+import math
+from typing import TYPE_CHECKING
+
+import torch
+
+import isaaclab.sim as sim_utils
+import isaaclab.utils.math as math_utils
+from isaaclab.assets import AssetBaseCfg
+from isaaclab.markers.config import FRAME_MARKER_CFG
+from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import FrameTransformerCfg, OffsetCfg
+from isaaclab.utils import configclass, instantiate, replace
+
+if TYPE_CHECKING:
+    from isaaclab.assets import Articulation
+    from isaaclab.scene import InteractiveScene
+    from isaaclab.sensors import FrameTransformer
+
+##
+# Pre-defined configs
+##
+from isaaclab_assets.robots.anymal import ANYMAL_C_CFG  # isort:skip
+
+ROBOT_PRIM_PATH_EXPR = "{ENV_REGEX_NS}/Robot"
+ROT_OFFSET = math_utils.quat_from_euler_xyz(torch.zeros(1), torch.zeros(1), torch.tensor(-math.pi / 2))
+POS_OFFSET = math_utils.quat_apply(ROT_OFFSET[0], torch.tensor([0.08795, 0.01305, -0.33797]))
+
+
+@configclass
+class FrameTransformerSceneCfg(InteractiveSceneCfg):
+    """Robot and sensor declarations share the scene's clone lifecycle."""
+
+    ground = AssetBaseCfg(prim_path="/World/defaultGroundPlane", spawn=sim_utils.GroundPlaneCfg())
+    light = AssetBaseCfg(
+        prim_path="/World/Light", spawn=sim_utils.DistantLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
+    )
+    robot = replace(ANYMAL_C_CFG, prim_path=ROBOT_PRIM_PATH_EXPR)
+
+    # Example using .* to get full body + LF_FOOT
+    frame_transformer = FrameTransformerCfg(
+        prim_path=f"{ROBOT_PRIM_PATH_EXPR}/base",
+        target_frames=[
+            FrameTransformerCfg.FrameCfg(prim_path=f"{ROBOT_PRIM_PATH_EXPR}/.*"),
+            FrameTransformerCfg.FrameCfg(
+                prim_path=f"{ROBOT_PRIM_PATH_EXPR}/LF_SHANK",
+                name="LF_FOOT_USER",
+                offset=OffsetCfg(pos=tuple(POS_OFFSET.tolist()), rot=tuple(ROT_OFFSET[0].tolist())),
+            ),
+        ],
+        debug_vis=False,
+    )
+
+
+def run_simulator(sim: sim_utils.SimulationContext, scene: "InteractiveScene"):
+    """Run the simulator."""
+    # Define simulation stepping
+    sim_dt = sim.get_physics_dt()
+    sim_time = 0.0
+    count = 0
+
+    # extract entities for simplified notation
+    robot: Articulation = scene["robot"]
+    frame_transformer: FrameTransformer = scene["frame_transformer"]
+
+    # We only want one visualization at a time. This visualizer will be used
+    # to step through each frame so the user can verify that the correct frame
+    # is being visualized as the frame names are printing to console
+    if sim.has_gui:
+        cfg = replace(FRAME_MARKER_CFG, prim_path="/Visuals/FrameVisualizerFromScript")
+        cfg.markers["frame"].scale = (0.1, 0.1, 0.1)
+        transform_visualizer = instantiate(cfg)
+    else:
+        transform_visualizer = None
+
+    frame_index = 0
+    # Simulate physics
+    while sim.is_running():
+        # perform this loop at policy control freq (50 Hz)
+        robot.set_joint_position_target_index(target=robot.data.default_joint_pos.torch.clone())
+        robot.write_data_to_sim()
+        # perform step
+        sim.step()
+        # update sim-time
+        sim_time += sim_dt
+        count += 1
+        # read data from sim
+        robot.update(sim_dt)
+        frame_transformer.update(dt=sim_dt)
+
+        # Change the frame that we are visualizing to ensure that frame names
+        # are correctly associated with the frames
+        if sim.has_gui:
+            if count % 50 == 0:
+                # get frame names
+                frame_names = frame_transformer.data.target_frame_names
+                # increment frame index
+                frame_index += 1
+                frame_index = frame_index % len(frame_names)
+                print(f"Displaying Frame ID {frame_index}: {frame_names[frame_index]}")
+
+            # visualize frame
+            source_pos = frame_transformer.data.source_pos_w.torch
+            source_quat = frame_transformer.data.source_quat_w.torch
+            target_pos = frame_transformer.data.target_pos_w.torch[:, frame_index]
+            target_quat = frame_transformer.data.target_quat_w.torch[:, frame_index]
+            # draw the frames
+            transform_visualizer.visualize(
+                torch.cat([source_pos, target_pos], dim=0), torch.cat([source_quat, target_quat], dim=0)
+            )
+
+
+def main():
+    """Main function."""
+    # Configure the simulation
+    sim_cfg = sim_utils.SimulationCfg(dt=0.005, device=args_cli.device)
+    # Launch the simulator runtime that the configuration needs
+    with launch_simulation(sim_cfg, args_cli):
+        # Initialize the simulation context
+        sim = sim_utils.SimulationContext(sim_cfg)
+        # Set main camera
+        sim.set_camera_view(eye=[2.5, 2.5, 2.5], target=[0.0, 0.0, 0.0])
+        # Design scene
+        scene_cfg = FrameTransformerSceneCfg(num_envs=1, env_spacing=0.0)
+        scene = instantiate(scene_cfg)
+        # Play the simulator
+        sim.reset()
+        # Now we are ready!
+        print("[INFO]: Setup complete...")
+        # Run the simulator
+        run_simulator(sim, scene)
+
+
+if __name__ == "__main__":
+    # Run the main function
+    main()

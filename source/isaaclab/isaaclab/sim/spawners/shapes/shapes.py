@@ -1,0 +1,365 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+from __future__ import annotations
+
+import math
+from collections.abc import Callable
+from typing import TYPE_CHECKING
+
+from pxr import Usd, UsdGeom
+
+from isaaclab.utils import validate
+
+from ... import schemas
+from ...utils import bind_physics_material, bind_visual_material, clone, create_prim, get_current_stage
+from ..materials.physics_materials import spawn_physics_material
+from ..spawner_cfg import RigidObjectSpawnerCfg
+from ..utils import apply_mesh_collision_props, apply_schema_props
+
+if TYPE_CHECKING:
+    from . import shapes_cfg
+
+
+@clone
+def spawn_sphere(
+    prim_path: str,
+    cfg: shapes_cfg.SphereCfg,
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+    **kwargs,
+) -> Usd.Prim:
+    """Create a USDGeom-based sphere prim with the given attributes.
+
+    For more information, see `USDGeomSphere <https://openusd.org/dev/api/class_usd_geom_sphere.html>`_.
+
+    .. note::
+        This function is decorated with :func:`clone` that resolves prim path into list of paths
+        if the input prim path is a regex pattern. This is done to support spawning multiple assets
+        from a single and cloning the USD prim at the given path expression.
+
+    Args:
+        prim_path: The prim path or pattern to spawn the asset at. If the prim path is a regex pattern,
+            then the asset is spawned at all the matching prim paths.
+        cfg: The configuration instance.
+        translation: The translation to apply to the prim w.r.t. its parent prim. Defaults to None, in which case
+            this is set to the origin.
+        orientation: The orientation in (x, y, z, w) to apply to the prim w.r.t. its parent prim. Defaults to None,
+            in which case this is set to identity.
+
+    Returns:
+        The created prim.
+
+    Raises:
+        ValueError: If a prim already exists at the given path.
+    """
+    return spawn_geom_from_prim_type(prim_path, cfg, "Sphere", {"radius": cfg.radius}, translation, orientation)
+
+
+@clone
+def spawn_cuboid(
+    prim_path: str,
+    cfg: shapes_cfg.CuboidCfg,
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+    **kwargs,
+) -> Usd.Prim:
+    """Create a USDGeom-based cuboid prim with the given attributes.
+
+    For more information, see `USDGeomCube <https://openusd.org/dev/api/class_usd_geom_cube.html>`_.
+
+    Note:
+        Since USD only supports cubes, we set the size of the cube to the minimum of the given size and
+        scale the cube accordingly.
+
+    .. note::
+        This function is decorated with :func:`clone` that resolves prim path into list of paths
+        if the input prim path is a regex pattern. This is done to support spawning multiple assets
+        from a single and cloning the USD prim at the given path expression.
+
+    Args:
+        prim_path: The prim path or pattern to spawn the asset at. If the prim path is a regex pattern,
+            then the asset is spawned at all the matching prim paths.
+        cfg: The configuration instance.
+        translation: The translation to apply to the prim w.r.t. its parent prim. Defaults to None, in which case
+            this is set to the origin.
+        orientation: The orientation in (x, y, z, w) to apply to the prim w.r.t. its parent prim. Defaults to None,
+            in which case this is set to identity.
+
+    Returns:
+        The created prim.
+
+    Raises:
+        If a prim already exists at the given path.
+    """
+    size = min(cfg.size)
+    scale = [dim / size for dim in cfg.size]
+    return spawn_geom_from_prim_type(prim_path, cfg, "Cube", {"size": size}, translation, orientation, scale)
+
+
+@clone
+def spawn_cylinder(
+    prim_path: str,
+    cfg: shapes_cfg.CylinderCfg,
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+    **kwargs,
+) -> Usd.Prim:
+    """Create a USDGeom-based cylinder prim with the given attributes.
+
+    For more information, see `USDGeomCylinder <https://openusd.org/dev/api/class_usd_geom_cylinder.html>`_.
+
+    .. note::
+        This function is decorated with :func:`clone` that resolves prim path into list of paths
+        if the input prim path is a regex pattern. This is done to support spawning multiple assets
+        from a single and cloning the USD prim at the given path expression.
+
+    Args:
+        prim_path: The prim path or pattern to spawn the asset at. If the prim path is a regex pattern,
+            then the asset is spawned at all the matching prim paths.
+        cfg: The configuration instance.
+        translation: The translation to apply to the prim w.r.t. its parent prim. Defaults to None, in which case
+            this is set to the origin.
+        orientation: The orientation in (x, y, z, w) to apply to the prim w.r.t. its parent prim. Defaults to None,
+            in which case this is set to identity.
+
+    Returns:
+        The created prim.
+
+    Raises:
+        ValueError: If a prim already exists at the given path.
+    """
+    attributes = {"radius": cfg.radius, "height": cfg.height, "axis": cfg.axis.upper()}
+    return spawn_geom_from_prim_type(prim_path, cfg, "Cylinder", attributes, translation, orientation)
+
+
+@clone
+def spawn_capsule(
+    prim_path: str,
+    cfg: shapes_cfg.CapsuleCfg,
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+    **kwargs,
+) -> Usd.Prim:
+    """Create a USDGeom-based capsule prim with the given attributes.
+
+    For more information, see `USDGeomCapsule <https://openusd.org/dev/api/class_usd_geom_capsule.html>`_.
+
+    .. note::
+        This function is decorated with :func:`clone` that resolves prim path into list of paths
+        if the input prim path is a regex pattern. This is done to support spawning multiple assets
+        from a single and cloning the USD prim at the given path expression.
+
+    Args:
+        prim_path: The prim path or pattern to spawn the asset at. If the prim path is a regex pattern,
+            then the asset is spawned at all the matching prim paths.
+        cfg: The configuration instance.
+        translation: The translation to apply to the prim w.r.t. its parent prim. Defaults to None, in which case
+            this is set to the origin.
+        orientation: The orientation in (x, y, z, w) to apply to the prim w.r.t. its parent prim. Defaults to None,
+            in which case this is set to identity.
+
+    Returns:
+        The created prim.
+
+    Raises:
+        ValueError: If a prim already exists at the given path.
+    """
+    attributes = {"radius": cfg.radius, "height": cfg.height, "axis": cfg.axis.upper()}
+    return spawn_geom_from_prim_type(prim_path, cfg, "Capsule", attributes, translation, orientation)
+
+
+@clone
+def spawn_cone(
+    prim_path: str,
+    cfg: shapes_cfg.ConeCfg,
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+    **kwargs,
+) -> Usd.Prim:
+    """Create a USDGeom-based cone prim with the given attributes.
+
+    For more information, see `USDGeomCone <https://openusd.org/dev/api/class_usd_geom_cone.html>`_.
+
+    .. note::
+        This function is decorated with :func:`clone` that resolves prim path into list of paths
+        if the input prim path is a regex pattern. This is done to support spawning multiple assets
+        from a single and cloning the USD prim at the given path expression.
+
+    Args:
+        prim_path: The prim path or pattern to spawn the asset at. If the prim path is a regex pattern,
+            then the asset is spawned at all the matching prim paths.
+        cfg: The configuration instance.
+        translation: The translation to apply to the prim w.r.t. its parent prim. Defaults to None, in which case
+            this is set to the origin.
+        orientation: The orientation in (x, y, z, w) to apply to the prim w.r.t. its parent prim. Defaults to None,
+            in which case this is set to identity.
+
+    Returns:
+        The created prim.
+
+    Raises:
+        ValueError: If a prim already exists at the given path.
+    """
+    attributes = {"radius": cfg.radius, "height": cfg.height, "axis": cfg.axis.upper()}
+    return spawn_geom_from_prim_type(prim_path, cfg, "Cone", attributes, translation, orientation)
+
+
+@clone
+def spawn_cable(
+    prim_path: str,
+    cfg: shapes_cfg.CableCfg,
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+    **kwargs,
+) -> Usd.Prim:
+    """Create an open linear ``UsdGeom.BasisCurves`` cable.
+
+    Args:
+        prim_path: The prim path or pattern to spawn the cable at.
+        cfg: The cable configuration.
+        translation: Local translation of the cable root [m].
+        orientation: Local orientation in ``(x, y, z, w)`` order.
+        **kwargs: Additional arguments consumed by :func:`clone`.
+
+    Returns:
+        The created cable root prim.
+    """
+    if len(cfg.positions) < 3:
+        raise ValueError(f"CableCfg requires at least three positions, got {len(cfg.positions)}.")
+    if any(len(point) != 3 for point in cfg.positions):
+        raise ValueError("CableCfg positions must contain exactly three coordinates.")
+    if any(not math.isfinite(coordinate) for point in cfg.positions for coordinate in point):
+        raise ValueError("CableCfg positions must contain only finite coordinates.")
+    if any(math.dist(start, end) <= 1.0e-8 for start, end in zip(cfg.positions, cfg.positions[1:])):
+        raise ValueError(
+            "CableCfg consecutive positions must be separated by more than 1e-8 m in the cable-local frame."
+        )
+    validate(cfg.physics_material)
+
+    attributes = {
+        "points": cfg.positions,
+        "curveVertexCounts": [len(cfg.positions)],
+        "type": UsdGeom.Tokens.linear,
+        "wrap": UsdGeom.Tokens.nonperiodic,
+        "widths": [cfg.physics_material.thickness],
+    }
+    prim = spawn_geom_from_prim_type(
+        prim_path,
+        cfg,
+        "BasisCurves",
+        attributes,
+        translation,
+        orientation,
+        geometry_schema_func=schemas.define_deformable_curve_properties,
+    )
+    curve_prim = prim.GetStage().GetPrimAtPath(f"{prim_path}/geometry/mesh")
+    UsdGeom.BasisCurves(curve_prim).SetWidthsInterpolation(UsdGeom.Tokens.constant)
+    return prim
+
+
+"""
+Helper functions.
+"""
+
+
+def spawn_geom_from_prim_type(
+    prim_path: str,
+    cfg: shapes_cfg.ShapeCfg | shapes_cfg.CableCfg,
+    prim_type: str,
+    attributes: dict,
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+    scale: tuple[float, float, float] | None = None,
+    stage: Usd.Stage | None = None,
+    geometry_schema_func: Callable[[str, Usd.Stage | None], None] | None = None,
+) -> Usd.Prim:
+    """Create a USDGeom-based prim with the given attributes.
+
+    To make the asset instanceable, we must follow a certain structure dictated by how USD scene-graph
+    instancing and physics work. The rigid body component must be added to each instance and not the
+    referenced asset (i.e. the prototype prim itself). This is because the rigid body component defines
+    properties that are specific to each instance and cannot be shared under the referenced asset. For
+    more information, please check the `documentation <https://docs.isaacsim.omniverse.nvidia.com/latest/physics/simulation_fundamentals.html#rigid-body>`_.
+
+    Due to the above, we follow the following structure:
+
+    * ``{prim_path}`` - The root prim that is an Xform with the rigid body and mass APIs if configured.
+    * ``{prim_path}/geometry`` - The prim that contains the mesh and optionally the materials if configured.
+      If instancing is enabled, this prim will be an instanceable reference to the prototype prim.
+
+    Args:
+        prim_path: The prim path to spawn the asset at.
+        cfg: The config containing the properties to apply.
+        prim_type: The type of prim to create.
+        attributes: The attributes to apply to the prim.
+        translation: The translation to apply to the prim w.r.t. its parent prim. Defaults to None, in which case
+            this is set to the origin.
+        orientation: The orientation in (x, y, z, w) to apply to the prim w.r.t. its parent prim. Defaults to None,
+            in which case this is set to identity.
+        scale: The scale to apply to the prim. Defaults to None, in which case this is set to identity.
+        stage: The stage to spawn the asset at. Defaults to None, in which case the current stage is used.
+        geometry_schema_func: A schema writer called on the geometry prim after creation.
+
+    Returns:
+        The created root prim.
+
+    Raises:
+        ValueError: If a prim already exists at the given path.
+    """
+    stage = stage if stage is not None else get_current_stage()
+
+    prim = create_prim(prim_path, prim_type="Xform", translation=translation, orientation=orientation, stage=stage)
+    geom_prim_path = prim_path + "/geometry"
+    mesh_prim_path = geom_prim_path + "/mesh"
+    create_prim(mesh_prim_path, prim_type, scale=scale, attributes=attributes, stage=stage)
+    if geometry_schema_func is not None:
+        geometry_schema_func(mesh_prim_path, stage=stage)
+
+    # collision properties anchor at the geometry prim
+    if cfg.collision_props is not None:
+        apply_schema_props(
+            cfg.collision_props,
+            mesh_prim_path,
+            schemas.apply_collision_properties,
+            schemas.define_collision_properties,
+            stage,
+        )
+    # mesh-collision properties target the collider authored above; cables carry none
+    if isinstance(cfg, RigidObjectSpawnerCfg) and cfg.mesh_collision_props is not None:
+        apply_mesh_collision_props(cfg.mesh_collision_props, mesh_prim_path, "", stage)
+    if cfg.visual_material is not None:
+        material_path = (
+            cfg.visual_material_path
+            if cfg.visual_material_path.startswith("/")
+            else f"{geom_prim_path}/{cfg.visual_material_path}"
+        )
+        cfg.visual_material.func(material_path, cfg.visual_material)
+        bind_visual_material(mesh_prim_path, material_path, stage=stage)
+    if cfg.physics_material is not None:
+        material_path = (
+            cfg.physics_material_path
+            if cfg.physics_material_path.startswith("/")
+            else f"{geom_prim_path}/{cfg.physics_material_path}"
+        )
+        spawn_physics_material(material_path, cfg.physics_material, stage=stage)
+        bind_physics_material(mesh_prim_path, material_path, stage=stage)
+
+    # mass and rigid body properties anchor at the container prim and are applied last so the
+    # geometry can later be made instanceable; cables carry neither
+    if isinstance(cfg, RigidObjectSpawnerCfg):
+        if cfg.mass_props is not None:
+            apply_schema_props(
+                cfg.mass_props, prim_path, schemas.apply_mass_properties, schemas.define_mass_properties, stage
+            )
+        if cfg.rigid_props is not None:
+            apply_schema_props(
+                cfg.rigid_props,
+                prim_path,
+                schemas.apply_rigid_body_properties,
+                schemas.define_rigid_body_properties,
+                stage,
+            )
+    return prim
