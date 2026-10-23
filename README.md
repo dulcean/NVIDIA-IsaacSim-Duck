@@ -1,4 +1,4 @@
-![Isaac Lab](./docs/microduck.jpg)
+![Isaac Lab](./docs/microduck.png)
 
 ---
 
