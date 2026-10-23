@@ -26,3 +26,23 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{__name__}.agents.rsl_rl_ppo_cfg:MicroDuckRoughPPORunnerCfg",
     },
 )
+
+gym.register(
+    id="IsaacContrib-Heading-MicroDuck",
+    entry_point=f"{__name__}.ball_env:MicroDuckBallEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ball_env_cfg:MicroDuckHeadingEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{__name__}.agents.ball_ppo_cfg:MicroDuckHeadingPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="IsaacContrib-Volley-MicroDuck",
+    entry_point=f"{__name__}.ball_env:MicroDuckBallEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ball_env_cfg:MicroDuckVolleyEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{__name__}.agents.ball_ppo_cfg:MicroDuckVolleyPPORunnerCfg",
+    },
+)

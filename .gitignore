@@ -5,7 +5,7 @@ _*/
 !skills/_internal/
 # exclude local website repo, used for publishing
 website/
-
+logs/
 .lastrun
 .lastformat
 .lastverify
