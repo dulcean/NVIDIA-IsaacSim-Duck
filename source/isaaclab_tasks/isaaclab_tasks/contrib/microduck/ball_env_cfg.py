@@ -57,6 +57,7 @@ class MicroDuckHeadingSceneCfg(InteractiveSceneCfg):
         filter_prim_paths_expr=["{ENV_REGEX_NS}/Ball"],
         history_length=4,
         update_period=0.005,
+        track_contact_points=True,
     )
     light = AssetBaseCfg(
         prim_path="/World/Light",
@@ -114,11 +115,20 @@ class MicroDuckHeadingEnvCfg(DirectRLEnvCfg):
     court_half_width: float = 0.35
     court_half_length: float = 0.65
     # These are rigid-body names, not visual meshes. Verify the startup report on the GPU machine.
-    head_body_pattern: str = "(yaw_roll_motion|jaw_soft)"
+    head_body_pattern: str = "jaw_soft"
     head_reference_body: str = "jaw_soft"
+    # Measured in the full-collision USD's rigid jaw_soft frame: +X is up, -Z is camera-forward.
+    camera_forward_axis: tuple[float, float, float] = (0.0, 0.0, -1.0)
+    camera_offset: tuple[float, float, float] = (0.0155, -0.0000914, -0.05548)
+    strike_offset: tuple[float, float, float] = (0.035, 0.0, -0.07)
+    strike_patch_min: tuple[float, float, float] = (0.027, -0.04, -0.10)
+    strike_patch_max: tuple[float, float, float] = (0.045, 0.04, -0.05)
+    min_camera_cosine: float = 0.5
+    min_camera_up: float = 0.25
     contact_threshold: float = 0.001
     min_transfer_time: float = 0.08
     approach_reward_scale: float = 0.2
+    gaze_reward_scale: float = 0.2
     upright_reward_scale: float = 0.1
     action_rate_cost: float = 0.01
     joint_limit_cost: float = 0.2

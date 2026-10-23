@@ -48,7 +48,7 @@ def test_microduck_ball_physical_contact_and_floor_reset(device, task):
             forces = sensor.data.normal_force_matrix_w_history.torch[:, :, head_ids]
             saw_head_contact |= bool((forces.norm(dim=-1) > cfg.contact_threshold).any())
             # A terminal impact can reset the sensor history before step() returns.
-            saw_head_contact |= float(extras.get("log", {}).get("Metrics/head_hits", 0)) > 0
+            saw_head_contact |= float(extras.get("log", {}).get("Metrics/head_contacts", 0)) > 0
         assert saw_head_contact, "A dropped ball never reached a head collider: inspect USD and sensor bindings."
 
         env.reset()

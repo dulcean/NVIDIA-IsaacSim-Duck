@@ -26,8 +26,9 @@ First check both physical scenes, filtered ball/head contacts, finite stepping, 
 uv run --extra test python -m pytest source/isaaclab_tasks/test/test_microduck_ball.py -q
 ```
 
-The startup report prints which bodies count as the head. The test drops a ball onto those bodies;
-it must detect a real collision. Resolve sensor, asset, collision-capacity, or non-finite-state errors
+The startup report prints the rigid head body and measured camera-forward axis in world coordinates.
+The test drops a ball onto the head and must detect a real collision (a roof contact is physically
+detected but is not a legal strike). Resolve sensor, asset, collision-capacity, or non-finite-state errors
 before starting a long training run.
 
 Prepare the standing actor for the heading task:
@@ -38,7 +39,9 @@ uv run python scripts/tools/prepare_microduck_ball_checkpoint.py \
   logs/microduck_initialization/heading.pt --players 1
 ```
 
-The output is a new file; the utility refuses to overwrite an existing checkpoint. Start with a small
+This conversion is required: copying the original standing checkpoint alone does not create
+`logs/microduck_initialization/heading.pt`. The output is a new file; the utility refuses to overwrite
+an existing checkpoint. Start with a small
 runner smoke test. This checks execution, not learning success:
 
 ```bash
@@ -71,7 +74,8 @@ uv run --extra viser isaaclab play \
 Replace `RUN_DIRECTORY` and `ITERATION` with the actual saved run and checkpoint. Iteration count alone
 does not establish success. Watch for a stable robot, intentional upward strikes, and arrivals at the
 virtual target, rather than only a rising reward curve. Use `Metrics/target_success`, `head_hits`, `fell`,
-and `invalid_contact` alongside playback. The virtual target is fixed at the neutral head height during
+`invalid_contact`, and `gaze_alignment` alongside playback. `head_contacts` includes physical contacts
+that were rejected as strikes. The virtual target is fixed at the neutral forehead height during
 each episode, at the mirrored starting head position across the court center; it has no collider or visual marker.
 
 ## Progress to two robots
@@ -96,10 +100,25 @@ learned a useful strike. A 28-action pair checkpoint is for ordinary continuatio
 the transfer utility. Resume an existing ball run using its own task and checkpoint, without converting
 it again; the normal training command can restore that run's optimizer state.
 
-`Metrics/returns` counts alternating head contacts after the initial serve. Repeated hits by the same
-robot, simultaneous ambiguous hits, non-head ball contacts, falling, leaving a half-court, or dropping
+`Metrics/returns` counts alternating legal strikes after the initial serve. A strike must contact the
+front forehead patch **above the lens**, with the camera raised towards the ball. The MicroDuck USD's
+rigid `jaw_soft` frame has camera-forward along local **-Z**, and forehead-up along local **+X**.
+The patch bounds are `(0.027, -0.04, -0.10)` to `(0.045, 0.04, -0.05)` metres in that frame, measured
+against the asset geometry. A physical contact point, a camera-to-ball cosine of at least `0.5`, and
+a camera-forward/world-up dot product of at least `0.25` are required. The geometric forward cone is
+a camera-direction proxy, not an RGB sensor or an occlusion test. Onset geometry is sampled each
+5 ms physics step, so a brief contact cannot be credited using a later head orientation.
+
+Standing with the camera pointed forward and bouncing the ball off the upper lid does not count.
+The look-at-ball reward encourages the neck/head to aim at the approaching ball. All leg joints remain
+trainable; stepping, crouching, jumping, and landing are allowed by the controller. There is no reward
+for jumping alone, no airborne-foot penalty, and no prescribed jump animation. Whether the robot
+learns a useful jump has to be established in GPU rollouts.
+
+Repeated hits by the same robot, roof/lens contacts, simultaneous ambiguous hits, non-head ball contacts,
+falling, leaving a half-court, or dropping
 the ball end a rally. The first head contact is a hit, not a completed transfer. Rewards include sparse
-head-hit/return bonuses, a ballistic aiming bonus, small alignment/upright terms, and costs for abrupt
+head-hit/return bonuses, a ballistic aiming bonus, small positioning/gaze/upright terms, and costs for abrupt
 actions, joint limits, invalid contact, and falling. Aiming uses the partner's current head position;
 successful subsequent contacts are the actual return metric.
 
@@ -131,6 +150,7 @@ the real RSL-RL models and check inference preservation and that new connections
 
 ```bash
 uv run --extra test python -m pytest scripts/tools/test/test_prepare_microduck_ball_checkpoint.py -q
+uv run --extra test python -m pytest scripts/tools/test/test_microduck_heading_geometry.py -q
 ```
 
 For small steps of difficulty, increase `env.serve_spread` from `0.01` only after successful convenient

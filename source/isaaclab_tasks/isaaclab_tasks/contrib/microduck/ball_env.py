@@ -10,11 +10,12 @@ from __future__ import annotations
 import torch
 
 from isaaclab.envs import DirectRLEnv
-from isaaclab.utils.math import quat_apply_inverse
+from isaaclab.utils.math import quat_apply, quat_apply_inverse
 
 from isaaclab_assets.robots.microduck import MICRODUCK_JOINT_NAMES
 
 from .ball_env_cfg import MicroDuckHeadingEnvCfg
+from .heading_geometry import camera_alignment, front_strike_mask
 
 
 class MicroDuckBallEnv(DirectRLEnv):
@@ -47,8 +48,10 @@ class MicroDuckBallEnv(DirectRLEnv):
             )
             head_ids, head_names = robot.find_bodies(cfg.head_reference_body)
             contact_ids, contact_names = sensor.find_sensors(cfg.head_body_pattern)
-            if len(ids) != 14 or len(play_ids) != 14 or len(head_ids) != 1 or not contact_ids:
+            if len(ids) != 14 or len(play_ids) != 14 or len(head_ids) != 1 or len(contact_ids) != 1:
                 raise ValueError("MicroDuck ball task requires 14 servos/play hinges and resolved head bodies.")
+            if contact_names != head_names:
+                raise ValueError("Strike contacts and camera geometry must use the same rigid head frame.")
             if sensor.num_filter_objects != 1:
                 raise ValueError(f"Expected exactly one ball contact counterpart, got {sensor.filter_object_names}.")
             mask = torch.zeros(sensor.num_sensors, dtype=torch.bool, device=self.device)
@@ -58,6 +61,11 @@ class MicroDuckBallEnv(DirectRLEnv):
             self._head_ids.append(head_ids[0])
             self._head_masks.append(mask)
             print(f"[MicroDuck ball] {robot.cfg.prim_path}: head={head_names}, hit colliders={contact_names}")
+            forward = quat_apply(
+                robot.data.body_link_quat_w.torch[:1, head_ids[0]],
+                torch.tensor([cfg.camera_forward_axis], device=self.device),
+            )[0].tolist()
+            print(f"[MicroDuck ball] Initial camera axis in world: {forward}; up alignment={forward[2]:.3f}")
 
         shape = (self.num_envs, cfg.num_players)
         self._actions = torch.zeros(*shape, 14, device=self.device)
@@ -67,6 +75,8 @@ class MicroDuckBallEnv(DirectRLEnv):
         self._server = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._since_hit = torch.zeros(self.num_envs, device=self.device)
         self._hits = torch.zeros(self.num_envs, device=self.device)
+        self._raw_hits = torch.zeros_like(self._hits)
+        self._gaze_sum = torch.zeros_like(self._hits)
         self._returns = torch.zeros_like(self._hits)
         self._hit_event = torch.zeros_like(self._hits)
         self._return_event = torch.zeros_like(self._hits)
@@ -80,7 +90,15 @@ class MicroDuckBallEnv(DirectRLEnv):
 
     def _head_positions(self) -> torch.Tensor:
         return torch.stack(
-            [robot.data.body_link_pos_w.torch[:, body] for robot, body in zip(self._robots, self._head_ids)], dim=1
+            [
+                robot.data.body_link_pos_w.torch[:, body]
+                + quat_apply(
+                    robot.data.body_link_quat_w.torch[:, body],
+                    self._actions.new_tensor(self.cfg.strike_offset).expand(self.num_envs, -1),
+                )
+                for robot, body in zip(self._robots, self._head_ids)
+            ],
+            dim=1,
         )
 
     def _receivers(self) -> torch.Tensor:
@@ -101,10 +119,17 @@ class MicroDuckBallEnv(DirectRLEnv):
         self._return_event.zero_()
         self._aim_event.zero_()
         self._invalid.zero_()
+        self._skip_contact_sample = True
         self._since_hit += self.step_dt
         self._last_ball_pos.copy_(self._ball.data.root_link_pos_w.torch)
 
     def _apply_action(self):
+        # Sample the preceding physics substep before advancing again. The first
+        # call has no new state; the final substep is sampled in _get_dones.
+        if self._skip_contact_sample:
+            self._skip_contact_sample = False
+        else:
+            self._update_contacts()
         for i, (robot, ids) in enumerate(zip(self._robots, self._joint_ids)):
             target = self._actions[:, i] + robot.data.default_joint_pos.torch[:, ids]
             limits = robot.data.soft_joint_pos_limits.torch[:, ids]
@@ -149,20 +174,41 @@ class MicroDuckBallEnv(DirectRLEnv):
         return {"policy": torch.cat(observations, dim=-1)}
 
     def _update_contacts(self):
-        """Count onset events from the four physics samples, excluding non-head ball contacts."""
+        """Sample actual contact locations and head orientation at physics-step resolution."""
         receivers = self._receivers()
         ball_pos = self._ball.data.root_link_pos_w.torch
         ball_vel = self._ball.data.root_link_lin_vel_w.torch
-        for i, (sensor, head_mask) in enumerate(zip(self._sensors, self._head_masks)):
-            history = sensor.data.normal_force_matrix_w_history
-            if history is None:
-                raise RuntimeError("Filtered ball contact history is required for heading rewards.")
-            # N x history x bodies x ball x xyz. Eager sensor updates retain every substep.
-            touching = history.torch.norm(dim=-1).amax(dim=(1, 3)) > self.cfg.contact_threshold
+        for i, (robot, sensor, head_mask, body) in enumerate(
+            zip(self._robots, self._sensors, self._head_masks, self._head_ids)
+        ):
+            forces = sensor.data.normal_force_matrix_w
+            positions = sensor.data.contact_pos_w
+            if forces is None or positions is None:
+                raise RuntimeError("Filtered ball forces and contact positions are required for heading rewards.")
+            touching = forces.torch.norm(dim=-1).amax(dim=2) > self.cfg.contact_threshold
             head_contact = touching[:, head_mask].any(dim=1)
             other_contact = touching[:, ~head_mask].any(dim=1)
             onset = head_contact & ~self._contact[:, i]
+            head_pos = robot.data.body_link_pos_w.torch[:, body]
+            head_quat = robot.data.body_link_quat_w.torch[:, body]
+            contact_b = quat_apply_inverse(head_quat, positions.torch[:, head_mask, 0].squeeze(1) - head_pos)
+            ball_b = quat_apply_inverse(head_quat, ball_pos - head_pos) - ball_pos.new_tensor(self.cfg.camera_offset)
+            forward_up = quat_apply(
+                head_quat, ball_pos.new_tensor(self.cfg.camera_forward_axis).expand(self.num_envs, -1)
+            )[:, 2]
+            front_contact = front_strike_mask(
+                contact_b,
+                ball_b,
+                forward_up,
+                self.cfg.camera_forward_axis,
+                self.cfg.strike_patch_min,
+                self.cfg.strike_patch_max,
+                self.cfg.min_camera_cosine,
+                self.cfg.min_camera_up,
+            )
+            self._raw_hits += onset.float()
             valid = onset & (self._expected() == i) & ~self._invalid
+            valid &= front_contact
             previous = self._last_hitter >= 0
             if self.cfg.num_players == 1:
                 valid &= ~previous
@@ -182,15 +228,15 @@ class MicroDuckBallEnv(DirectRLEnv):
             self._last_hitter[valid] = i
             self._since_hit[valid] = 0
             self._contact[:, i] = head_contact
+
+    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        self._update_contacts()
         legal = (~self._invalid).float()
         self._hit_event *= legal
         self._return_event *= legal
         self._aim_event *= legal
         self._hits += self._hit_event
         self._returns += self._return_event
-
-    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        self._update_contacts()
         relative = self._ball.data.root_link_pos_w.torch - self.scene.env_origins
         self._max_height = torch.maximum(self._max_height, relative[:, 2])
         self._fell.zero_()
@@ -238,6 +284,14 @@ class MicroDuckBallEnv(DirectRLEnv):
         index = self._expected().view(-1, 1, 1).expand(-1, 1, 3)
         receiving_head = head_pos.gather(1, index).squeeze(1)
         approach = torch.exp(-(receiving_head[:, :2] - ball_pos[:, :2]).square().sum(-1) / 0.05**2)
+        gazes = []
+        for robot, body in zip(self._robots, self._head_ids):
+            ball_b = quat_apply_inverse(
+                robot.data.body_link_quat_w.torch[:, body], ball_pos - robot.data.body_link_pos_w.torch[:, body]
+            ) - ball_pos.new_tensor(self.cfg.camera_offset)
+            gazes.append(camera_alignment(ball_b, self.cfg.camera_forward_axis))
+        gaze = torch.stack(gazes, dim=1).gather(1, self._expected().unsqueeze(-1)).squeeze(-1).clamp_min(0)
+        self._gaze_sum += gaze
         upright = torch.stack([-r.data.projected_gravity_b.torch[:, 2] for r in self._robots], dim=1).mean(1)
         rate = (self._actions - self._previous_actions).square().sum(dim=(1, 2))
         limits_cost = torch.zeros(self.num_envs, device=self.device)
@@ -247,6 +301,7 @@ class MicroDuckBallEnv(DirectRLEnv):
             limits_cost += ((limits[..., 0] - pos).clamp_min(0) + (pos - limits[..., 1]).clamp_min(0)).sum(-1)
         dense = (
             self.cfg.approach_reward_scale * approach
+            + self.cfg.gaze_reward_scale * gaze
             + self.cfg.upright_reward_scale * upright
             - self.cfg.action_rate_cost * rate
             - self.cfg.joint_limit_cost * limits_cost
@@ -267,6 +322,10 @@ class MicroDuckBallEnv(DirectRLEnv):
         if hasattr(self, "_hits"):
             self.extras["log"] = {
                 "Metrics/head_hits": self._hits[env_ids].mean(),
+                "Metrics/head_contacts": self._raw_hits[env_ids].mean(),
+                "Metrics/gaze_alignment": (
+                    self._gaze_sum[env_ids] / self.episode_length_buf[env_ids].clamp_min(1)
+                ).mean(),
                 "Metrics/returns": self._returns[env_ids].mean(),
                 "Metrics/target_success": self._success[env_ids].float().mean(),
                 "Metrics/fell": self._fell[env_ids].float().mean(),
@@ -310,6 +369,8 @@ class MicroDuckBallEnv(DirectRLEnv):
             self._previous_actions,
             self._contact,
             self._hits,
+            self._raw_hits,
+            self._gaze_sum,
             self._returns,
             self._hit_event,
             self._return_event,
