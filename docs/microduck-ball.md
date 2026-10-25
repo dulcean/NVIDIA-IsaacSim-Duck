@@ -122,8 +122,9 @@ for jumping alone, no airborne-foot penalty, and no prescribed jump animation. W
 learns a useful jump has to be established in GPU rollouts.
 
 Repeated hits by the same robot, roof/lens contacts, simultaneous ambiguous hits, non-head ball contacts,
-falling, leaving a half-court, or dropping
-the ball end a rally. The first head contact is a hit, not a completed transfer. Rewards include sparse
+falling, leaving a half-court, or dropping the ball end a rally. In the pair task, ball misses
+start a post-rally recovery phase before the world resets; robot safety failures reset immediately.
+The first head contact is a hit, not a completed transfer. Rewards include sparse
 head-hit/return bonuses, a ballistic aiming bonus, small positioning/gaze/upright terms, and costs for abrupt
 actions, joint limits, invalid contact, and falling. Aiming uses the partner's current head position;
 successful subsequent contacts are the actual return metric.
@@ -223,8 +224,8 @@ banked for the player who made that strike. They are paid once after at least
 The height/speed checks are a landing proxy, not a foot-to-floor contact measurement.
 Jumping and head motion remain unrestricted; airborne motion simply delays payment.
 A new own strike restarts the recovery clock and retains banked credit; a partner's
-strike does not restart it. Any terminal step (including ball exits and timeouts)
-cancels all unpaid credit, taking priority over recovery on that same step. Reset
+strike does not restart it. A ball miss or any terminal step cancels all unpaid
+credit, taking priority over recovery on that same step. Reset
 clears the bank only for the affected worlds. Previously paid rewards are not revoked
 if the robot falls later; the recovery window is finite.
 
@@ -232,7 +233,8 @@ Two legal strikes with no recovery now receive only `0.4` in immediate strike bo
 If followed by a registered fall/collision/robot court exit (`-2`), their sparse subtotal
 is `-1.6`, before dense terms. Two fully recovered strikes still receive `7` to `11`
 in total strike/aim/return bonuses, before discounting. A ball exit alone has no `-2`
-fall cost, but forfeits outstanding credit. This discourages the observed shortcut;
+fall cost, but forfeits outstanding credit and incurs the separate miss cost described below.
+This discourages the observed shortcut;
 it does not prove that a learned policy will recover or that every short rally loses reward.
 The single-player heading task keeps its immediate strike rewards.
 
@@ -241,31 +243,62 @@ The volley task also charges a continuous cost for the least balanced player's t
 Each term takes the maximum over both players. Head orientation, yaw, root height,
 and vertical speed are not penalized by these terms; leg control and jumping remain available.
 Robot court exits and center-line violations also incur the existing fall cost and suppress
-positive strike bonuses on that step. Ball exits retain their existing termination behavior.
+positive strike bonuses on that step.
 This is an experimental reward correction, not a GPU-verified recovery skill.
 
+### Observe recovery after the rally ends
+
+In the pair task, ball-ground contacts, ball exits, and invalid ball contacts now stop the
+rally but keep simulation running for `0.6 s`. Ball strike scoring and ball-tracking rewards
+stop, unpaid strike credit is cancelled immediately, and each player's existing turn flag
+becomes `-1` to identify the recovery phase. Observation/action dimensions remain unchanged.
+No serve or ball teleport occurs during the phase; the ball continues under normal physics.
+
+Falls, robot collisions, robot court exits, and nonfinite state still terminate immediately,
+including during recovery. The usual balance/action costs remain active. A miss costs `0.5`
+once, including a miss before the first valid strike. At the phase deadline, both robots
+must have satisfied the recovery envelope continuously during the final `0.2 s` to earn
+`0.5`, and at least one legal strike must have occurred. The phase never ends early merely
+because the robots briefly look stable. Timeout cancels the completion bonus.
+Recovery without a legal strike earns no completion bonus; deliberate miss-and-recover
+cannot earn a positive net miss/completion bonus. Previously paid strike credit is not revoked.
+
+`Metrics/fell_after_miss` reveals falls that previously disappeared behind a ball-miss reset.
+`Metrics/post_rally_phase` is the fraction of episodes that entered this phase;
+`Metrics/post_rally_recovered` is the fraction ending it with both robots stable, even if
+no valid strike occurred. It is not the completion reward itself.
+`Metrics/rally_length_s` excludes the added phase: total episode length will increase
+mechanically and must not be treated as longer ball rallies. Ball/invalid-contact failure
+metrics retain their original causes across the phase; safety failure metrics can overlap.
+
 Keep the original spacing and serve while testing this objective. Start with a short continuation
-from the existing pair, with a fresh optimizer in a separate experiment:
+from the latest recovery pair, with a fresh optimizer in a separate experiment. First run
+the GPU integration test (its volley case now checks miss-to-recovery-to-fall reset):
 
 ```bash
-CHECKPOINT="$(ls -t logs/rsl_rl/microduck_volley_contact_fix/*/model_*.pt | head -n 1)"
-nohup uv run --extra viser isaaclab train \
-  --rl_library rsl_rl --task IsaacContrib-Volley-MicroDuck \
-  --experiment_name microduck_volley_recovery \
-  --num_envs 1024 --max_visible_envs 4 --max_iterations 500 --viz viser \
-  --checkpoint "$CHECKPOINT" --no-resume_optimizer_state \
-  env.separation=0.35 env.serve_height=0.25 env.serve_down_speed=0.2 \
-  > volley_recovery.log 2>&1 < /dev/null &
+uv run --extra test python -m pytest source/isaaclab_tasks/test/test_microduck_ball.py -q
 ```
 
-Inspect a checkpoint from `logs/rsl_rl/microduck_volley_recovery/` explicitly during playback.
+```bash
+CHECKPOINT="$(ls -t logs/rsl_rl/microduck_volley_recovery/*/model_*.pt | head -n 1)"
+nohup uv run --extra viser isaaclab train \
+  --rl_library rsl_rl --task IsaacContrib-Volley-MicroDuck \
+  --experiment_name microduck_volley_post_rally \
+  --num_envs 1024 --max_visible_envs 4 --max_iterations 200 --viz viser \
+  --checkpoint "$CHECKPOINT" --no-resume_optimizer_state \
+  env.separation=0.35 env.serve_height=0.25 env.serve_down_speed=0.2 \
+  > volley_post_rally.log 2>&1 < /dev/null &
+```
+
+Inspect a checkpoint from `logs/rsl_rl/microduck_volley_post_rally/` explicitly during playback.
 `Metrics/recovered_hits` counts strikes whose banked credit was paid; compare it with
 `Metrics/head_hits`. `Metrics/recovery_reward` is the mean sum of paid banked credit per episode.
 Compare returns, rally counts, episode length, robot exits, center crossings, and falling,
 alongside visible recovery after each strike. Standing still with fewer returns is not success.
 Do not widen the scene or change ball physics in this comparison. To reproduce the old volley
 reward for an ablation, set `env.defer_strike_rewards=false` and both torso costs to zero;
-the boundary failure correction still applies. Observation/action sizes are unchanged, so the old
+also set `env.post_rally_duration=0`. The boundary failure correction still applies.
+Observation/action sizes are unchanged, so the old
 pair checkpoint remains loadable; reward semantics changed, so use a fresh optimizer and a new run.
 
 The original small-scene settings use 0.35 m root separation and a serve 0.25 m above the forehead,

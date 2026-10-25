@@ -153,3 +153,59 @@ def test_another_own_strike_restarts_recovery_without_losing_credit():
         assert paid.sum() == 0
     paid, recovered = state.step(credit * 0, credit * 0, stable, ended, 0.02, 0.12, 0.10)
     assert paid.sum() == 2 and recovered.sum() == 2
+
+
+def test_miss_continues_simulation_until_deadline_without_restarting_clock():
+    """A missed rally remains observable for 0.6 s; unrelated worlds keep playing."""
+    state = rules.PostRallyRecovery(2, "cpu")
+    miss = torch.tensor([True, False])
+    no = torch.zeros(2, dtype=torch.bool)
+    stable = ~no
+    done, started, recovered = state.step(miss, no, no, stable, 0.2, 0.6, 0.2)
+    assert started.tolist() == [True, False]
+    assert not done.any() and not recovered.any()
+    for _ in range(2):
+        done, started, recovered = state.step(miss, no, no, stable, 0.2, 0.6, 0.2)
+        assert not done.any() and not started.any() and not recovered.any()
+    done, started, recovered = state.step(miss, no, no, stable, 0.2, 0.6, 0.2)
+    assert done.tolist() == [True, False]
+    assert recovered.tolist() == [True, False]
+    assert not started.any()
+
+
+def test_post_rally_checks_final_hold_and_safety_before_paying():
+    """Early stability cannot hide later collapse; terminal safety and timeout override recovery."""
+    state = rules.PostRallyRecovery(4, "cpu")
+    yes = torch.ones(4, dtype=torch.bool)
+    no = ~yes
+    state.step(yes, no, no, yes, 0.2, 0.6, 0.4)
+    state.step(no, no, no, yes, 0.2, 0.6, 0.4)
+    stable = torch.tensor([True, False, True, True])
+    done, _, recovered = state.step(no, no, no, stable, 0.2, 0.6, 0.4)
+    assert not done.any() and not recovered.any()
+    done, _, recovered = state.step(
+        no,
+        torch.tensor([False, False, False, True]),
+        torch.tensor([False, False, True, False]),
+        yes,
+        0.2,
+        0.6,
+        0.4,
+    )
+    assert done.all()
+    assert recovered.tolist() == [True, False, False, False]
+
+
+def test_post_rally_fall_ends_immediately_and_subset_reset_preserves_other_world():
+    """A collapse during the grace period must not wait for its timer or disappear into a reset."""
+    state = rules.PostRallyRecovery(2, "cpu")
+    yes = torch.ones(2, dtype=torch.bool)
+    no = ~yes
+    state.step(yes, no, no, yes, 0.2, 0.6, 0.2)
+    done, _, recovered = state.step(no, torch.tensor([True, False]), no, yes, 0.2, 0.6, 0.2)
+    assert done.tolist() == [True, False] and not recovered.any()
+    state.reset(torch.tensor([0]))
+    for _ in range(2):
+        done, _, recovered = state.step(no, no, no, yes, 0.2, 0.6, 0.2)
+    assert done.tolist() == [False, True]
+    assert recovered.tolist() == [False, True]

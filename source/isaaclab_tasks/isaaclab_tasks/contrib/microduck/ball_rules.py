@@ -93,3 +93,41 @@ class RecoveryRewards:
         for state in (self.pending, self.hits, self.age, self.stable_time):
             state.masked_fill_(clear, 0.0)
         return paid, recovered
+
+
+class PostRallyRecovery:
+    """Continue simulation after a miss so a subsequent collapse remains observable."""
+
+    def __init__(self, num_envs: int, device: str):
+        self.active = torch.zeros(num_envs, device=device, dtype=torch.bool)
+        self.age = torch.zeros(num_envs, device=device)
+        self.stable_time = torch.zeros_like(self.age)
+
+    def reset(self, env_ids):
+        """Reset only the selected worlds."""
+        for state in (self.active, self.age, self.stable_time):
+            state[env_ids] = 0
+
+    def step(
+        self,
+        miss: torch.Tensor,
+        unsafe: torch.Tensor,
+        timeout: torch.Tensor,
+        stable: torch.Tensor,
+        dt: float,
+        duration: float,
+        hold: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """End immediately for safety, otherwise assess recovery only at the phase deadline.
+
+        Repeated ball misses cannot restart the clock. Early stability does not
+        release a reward or end the phase: both players must still be stable
+        throughout the final hold window. Timeouts never earn completion credit.
+        """
+        started = miss & ~self.active & ~unsafe & ~timeout
+        self.active |= started
+        self.age = torch.where(self.active & ~started, self.age + dt, 0.0)
+        self.stable_time = torch.where(self.active & ~started & stable, self.stable_time + dt, 0.0)
+        expired = self.active & (self.age + 1e-6 >= duration)
+        recovered = expired & (self.stable_time + 1e-6 >= hold) & ~unsafe & ~timeout
+        return unsafe | expired, started, recovered

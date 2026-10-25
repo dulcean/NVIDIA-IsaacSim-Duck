@@ -22,7 +22,7 @@ from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 @pytest.mark.parametrize("device", test_devices(DeviceScope.CUDA))
 @pytest.mark.parametrize("task", ["IsaacContrib-Heading-MicroDuck", "IsaacContrib-Volley-MicroDuck"])
 def test_microduck_ball_physical_contact_and_floor_reset(device, task):
-    """A real dropped ball reaches a head sensor, and a missed ball resets only its own world."""
+    """Real contacts are sensed; a miss resets heading or starts recovery before a volley fall reset."""
     cfg = parse_env_cfg(task, device=device, num_envs=2)
     sim_utils.create_new_stage()
     env = gym.make(task, cfg=cfg).unwrapped
@@ -59,10 +59,21 @@ def test_microduck_ball_physical_contact_and_floor_reset(device, task):
         ball.write_root_pose_to_sim_index(root_pose=pose)
         ball.write_root_velocity_to_sim_index(root_velocity=torch.zeros(2, 6, device=device))
         obs, reward, terminated, truncated, _ = env.step(torch.zeros(2, cfg.action_space, device=device))
+        if cfg.post_rally_duration > 0:
+            assert not terminated.any() and not truncated.any()
+            assert env._post_rally.active.tolist() == [True, False]
+            assert env.episode_length_buf[0] == 1
+            # A subsequent torso collapse must terminate world 0 even though its ball miss did not.
+            root = robot.data.root_link_pose_w.torch.clone()
+            root[0, 3:7] = torch.tensor((0.70710678, 0.70710678, 0.0, 0.0), device=device)
+            robot.write_root_pose_to_sim_index(root_pose=root)
+            obs, reward, terminated, truncated, extras = env.step(torch.zeros(2, cfg.action_space, device=device))
+            assert float(extras["log"]["Metrics/fell_after_miss"]) > 0
         assert terminated[0] and not truncated[0]
         assert not terminated[1] and not truncated[1]
         assert ball.data.root_link_pos_w.torch[0, 2] > env.scene.env_origins[0, 2] + cfg.ball_radius + 0.1
-        assert env.episode_length_buf[0] == 0 and env.episode_length_buf[1] == 1
+        assert env.episode_length_buf[0] == 0
+        assert env.episode_length_buf[1] == (2 if cfg.post_rally_duration > 0 else 1)
         assert torch.isfinite(obs["policy"]).all() and torch.isfinite(reward).all()
     finally:
         env.close()

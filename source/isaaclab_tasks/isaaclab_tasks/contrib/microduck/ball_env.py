@@ -15,7 +15,7 @@ from isaaclab.utils.math import quat_apply, quat_apply_inverse
 from isaaclab_assets.robots.microduck import MICRODUCK_JOINT_NAMES
 
 from .ball_env_cfg import MicroDuckHeadingEnvCfg
-from .ball_rules import RecoveryRewards, balance_errors, classify_head_contact, robot_collision_mask
+from .ball_rules import PostRallyRecovery, RecoveryRewards, balance_errors, classify_head_contact, robot_collision_mask
 from .heading_geometry import camera_alignment, front_strike_mask
 
 
@@ -73,6 +73,13 @@ class MicroDuckBallEnv(DirectRLEnv):
 
         shape = (self.num_envs, cfg.num_players)
         self._recovery = RecoveryRewards(self.num_envs, cfg.num_players, self.device)
+        self._post_rally = PostRallyRecovery(self.num_envs, self.device)
+        self._post_recovered = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self._fell_after_miss = torch.zeros_like(self._post_recovered)
+        self._rally_invalid = torch.zeros_like(self._post_recovered)
+        self._miss_event = torch.zeros_like(self._post_recovered)
+        self._rally_steps = torch.zeros(self.num_envs, device=self.device)
+        self._gaze_steps = torch.zeros_like(self._rally_steps)
         self._player_hit_event = torch.zeros(*shape, device=self.device)
         self._player_aim_event = torch.zeros_like(self._player_hit_event)
         self._player_return_event = torch.zeros_like(self._player_hit_event)
@@ -133,6 +140,22 @@ class MicroDuckBallEnv(DirectRLEnv):
             return self._server
         return torch.where(self._last_hitter < 0, self._server, 1 - self._last_hitter)
 
+    def _stable_players(self) -> torch.Tensor:
+        """Torso recovery and approximate landing envelope, without restricting head pose or yaw."""
+        stable = []
+        for robot in self._robots:
+            data = robot.data
+            height = data.root_link_pos_w.torch[:, 2] - self.scene.env_origins[:, 2]
+            initial_height = data.default_root_pose.torch[:, 2]
+            stable.append(
+                (-data.projected_gravity_b.torch[:, 2] >= self.cfg.recovery_min_upright)
+                & (data.root_link_ang_vel_b.torch[:, :2].norm(dim=-1) <= self.cfg.recovery_max_tumbling)
+                & (height >= initial_height * self.cfg.recovery_min_height_ratio)
+                & (height <= initial_height + self.cfg.recovery_max_height_offset)
+                & (data.root_link_lin_vel_w.torch[:, 2].abs() <= self.cfg.recovery_max_vertical_speed)
+            )
+        return torch.stack(stable, dim=1)
+
     def _pre_physics_step(self, actions: torch.Tensor):
         self._previous_actions.copy_(self._actions)
         self._actions.copy_(actions.reshape_as(self._actions))
@@ -192,7 +215,7 @@ class MicroDuckBallEnv(DirectRLEnv):
                     quat_apply_inverse(quat, ball_pos - data.root_link_pos_w.torch),
                     quat_apply_inverse(quat, ball_vel - data.root_link_lin_vel_w.torch),
                     quat_apply_inverse(quat, receivers[:, i] - data.root_link_pos_w.torch),
-                    (expected == i).float().unsqueeze(-1),
+                    torch.where(self._post_rally.active, -1.0, (expected == i).float()).unsqueeze(-1),
                 ),
                 dim=-1,
             )
@@ -219,7 +242,8 @@ class MicroDuckBallEnv(DirectRLEnv):
             touching = forces.torch.norm(dim=-1).amax(dim=2) > self.cfg.contact_threshold
             head_contact = touching[:, head_mask].any(dim=1)
             other_contact = touching[:, ~head_mask].any(dim=1)
-            onset = head_contact & ~self._contact[:, i]
+            onset = head_contact & ~self._contact[:, i] & ~self._post_rally.active
+            other_contact &= ~self._post_rally.active
             head_pos = robot.data.body_link_pos_w.torch[:, body]
             head_quat = robot.data.body_link_quat_w.torch[:, body]
             contact_b = quat_apply_inverse(head_quat, positions.torch[:, head_mask, 0].squeeze(1) - head_pos)
@@ -299,14 +323,41 @@ class MicroDuckBallEnv(DirectRLEnv):
                 crossed_center |= root[:, 0] > -0.03 if i == 0 else root[:, 0] < 0.03
         outside = ball_outside | robot_outside | crossed_center
         ground = relative[:, 2] <= self.cfg.ball_radius + 0.001
-        self._ground.copy_(ground)
-        self._outside.copy_(outside)
-        self._ball_outside.copy_(ball_outside)
-        self._robot_outside.copy_(robot_outside)
-        self._crossed_center.copy_(crossed_center)
+        live = ~self._post_rally.active
+        self._rally_steps += live.float()
+        self._ground |= ground & live
+        self._outside |= (ball_outside & live) | robot_outside | crossed_center
+        self._ball_outside |= ball_outside & live
+        self._robot_outside |= robot_outside
+        self._crossed_center |= crossed_center
+        self._rally_invalid |= self._invalid
+        timeout = self.episode_length_buf >= self.max_episode_length - 1
+        post_done = torch.zeros_like(timeout)
+        self._miss_event.zero_()
+        self._post_recovered.zero_()
+        if self.cfg.post_rally_duration > 0:
+            unsafe = nonfinite | self._fell | self._robot_collision | robot_outside | crossed_center
+            post_done, self._miss_event, self._post_recovered = self._post_rally.step(
+                ground | ball_outside | self._invalid,
+                unsafe,
+                timeout,
+                self._stable_players().all(-1),
+                self.step_dt,
+                self.cfg.post_rally_duration,
+                self.cfg.post_rally_hold,
+            )
+            self._fell_after_miss |= self._fell & self._post_rally.active
         # An impact in a collapsing or robot-collision step must not earn a positive strike bonus.
         legal = (
-            ~(self._invalid | self._fell | self._robot_collision | robot_outside | crossed_center | nonfinite)
+            ~(
+                self._invalid
+                | self._fell
+                | self._robot_collision
+                | robot_outside
+                | crossed_center
+                | nonfinite
+                | self._post_rally.active
+            )
         ).float()
         self._hit_event *= legal
         self._return_event *= legal
@@ -334,8 +385,8 @@ class MicroDuckBallEnv(DirectRLEnv):
             )
         failure = ground | outside | nonfinite | self._fell | self._invalid | self._robot_collision
         self._success &= ~failure
-        died = failure | self._success
-        return died, self.episode_length_buf >= self.max_episode_length - 1
+        died = post_done if self.cfg.post_rally_duration > 0 else failure | self._success
+        return died, timeout
 
     def _get_rewards(self) -> torch.Tensor:
         head_pos = self._head_positions()
@@ -350,7 +401,9 @@ class MicroDuckBallEnv(DirectRLEnv):
             ) - ball_pos.new_tensor(self.cfg.camera_offset)
             gazes.append(camera_alignment(ball_b, self.cfg.camera_forward_axis))
         gaze = torch.stack(gazes, dim=1).gather(1, self._expected().unsqueeze(-1)).squeeze(-1).clamp_min(0)
-        self._gaze_sum += gaze
+        playing = (~self._post_rally.active).float()
+        self._gaze_sum += gaze * playing
+        self._gaze_steps += playing
         upright = torch.stack([-r.data.projected_gravity_b.torch[:, 2] for r in self._robots], dim=1).mean(1)
         tilt, tumbling = balance_errors(
             torch.stack([r.data.projected_gravity_b.torch for r in self._robots], dim=1),
@@ -363,8 +416,7 @@ class MicroDuckBallEnv(DirectRLEnv):
             pos = robot.data.joint_pos.torch[:, ids]
             limits_cost += ((limits[..., 0] - pos).clamp_min(0) + (pos - limits[..., 1]).clamp_min(0)).sum(-1)
         dense = (
-            self.cfg.approach_reward_scale * approach
-            + self.cfg.gaze_reward_scale * gaze
+            (self.cfg.approach_reward_scale * approach + self.cfg.gaze_reward_scale * gaze) * playing
             + self.cfg.upright_reward_scale * upright
             - self.cfg.torso_tilt_cost * tilt
             - self.cfg.torso_tumbling_cost * tumbling
@@ -377,18 +429,6 @@ class MicroDuckBallEnv(DirectRLEnv):
             + self.cfg.transfer_reward * self._return_event
         )
         if self.cfg.defer_strike_rewards:
-            stable = []
-            for robot in self._robots:
-                data = robot.data
-                height = data.root_link_pos_w.torch[:, 2] - self.scene.env_origins[:, 2]
-                initial_height = data.default_root_pose.torch[:, 2]
-                stable.append(
-                    (-data.projected_gravity_b.torch[:, 2] >= self.cfg.recovery_min_upright)
-                    & (data.root_link_ang_vel_b.torch[:, :2].norm(dim=-1) <= self.cfg.recovery_max_tumbling)
-                    & (height >= initial_height * self.cfg.recovery_min_height_ratio)
-                    & (height <= initial_height + self.cfg.recovery_max_height_offset)
-                    & (data.root_link_lin_vel_w.torch[:, 2].abs() <= self.cfg.recovery_max_vertical_speed)
-                )
             credit = (
                 self.cfg.hit_reward * (1 - self.cfg.immediate_hit_fraction) * self._player_hit_event
                 + self.cfg.aim_reward * self._player_aim_event
@@ -397,8 +437,8 @@ class MicroDuckBallEnv(DirectRLEnv):
             paid, recovered = self._recovery.step(
                 credit,
                 self._player_hit_event,
-                torch.stack(stable, dim=1),
-                self.reset_buf,
+                self._stable_players(),
+                self.reset_buf | self._post_rally.active,
                 self.step_dt,
                 self.cfg.recovery_delay,
                 self.cfg.recovery_hold,
@@ -413,6 +453,8 @@ class MicroDuckBallEnv(DirectRLEnv):
             - self.cfg.fall_cost
             * (self._fell | self._robot_collision | self._robot_outside | self._crossed_center).float()
             - self._invalid.float()
+            - self.cfg.miss_cost * self._miss_event.float()
+            + self.cfg.post_rally_reward * (self._post_recovered & (self._hits > 0)).float()
         )
         return torch.nan_to_num(reward, nan=-self.cfg.fall_cost, posinf=0.0, neginf=-self.cfg.fall_cost)
 
@@ -423,9 +465,11 @@ class MicroDuckBallEnv(DirectRLEnv):
             self.extras["log"] = {
                 "Metrics/head_hits": self._hits[env_ids].mean(),
                 "Metrics/head_contacts": self._raw_hits[env_ids].mean(),
-                "Metrics/gaze_alignment": (
-                    self._gaze_sum[env_ids] / self.episode_length_buf[env_ids].clamp_min(1)
-                ).mean(),
+                "Metrics/gaze_alignment": (self._gaze_sum[env_ids] / self._gaze_steps[env_ids].clamp_min(1)).mean(),
+                "Metrics/rally_length_s": (self._rally_steps[env_ids] * self.step_dt).mean(),
+                "Metrics/post_rally_phase": self._post_rally.active[env_ids].float().mean(),
+                "Metrics/post_rally_recovered": self._post_recovered[env_ids].float().mean(),
+                "Metrics/fell_after_miss": self._fell_after_miss[env_ids].float().mean(),
                 "Metrics/returns": self._returns[env_ids].mean(),
                 "Metrics/recovered_hits": self._recovered_hits[env_ids].mean(),
                 "Metrics/recovery_reward": self._recovery_reward_sum[env_ids].mean(),
@@ -435,7 +479,7 @@ class MicroDuckBallEnv(DirectRLEnv):
                 "Metrics/fast_returns": self._fast_returns[env_ids].mean(),
                 "Metrics/target_success": self._success[env_ids].float().mean(),
                 "Metrics/fell": self._fell[env_ids].float().mean(),
-                "Metrics/invalid_contact": self._invalid[env_ids].float().mean(),
+                "Metrics/invalid_contact": self._rally_invalid[env_ids].float().mean(),
                 "Metrics/invalid_head_surface": self._bad_surface[env_ids].float().mean(),
                 "Metrics/invalid_turn": self._bad_turn[env_ids].float().mean(),
                 "Metrics/invalid_body_contact": self._bad_body[env_ids].float().mean(),
@@ -449,6 +493,7 @@ class MicroDuckBallEnv(DirectRLEnv):
             }
         super()._reset_idx(env_ids)
         self._recovery.reset(env_ids)
+        self._post_rally.reset(env_ids)
         for i, robot in enumerate(self._robots):
             pose = robot.data.default_root_pose.torch[env_ids].clone()
             pose[:, :3] += self.scene.env_origins[env_ids]
@@ -481,6 +526,12 @@ class MicroDuckBallEnv(DirectRLEnv):
         self._ball.write_root_pose_to_sim_index(root_pose=pose, env_ids=env_ids)
         self._ball.write_root_velocity_to_sim_index(root_velocity=velocity, env_ids=env_ids)
         for buffer in (
+            self._post_recovered,
+            self._fell_after_miss,
+            self._rally_invalid,
+            self._miss_event,
+            self._rally_steps,
+            self._gaze_steps,
             self._player_hit_event,
             self._player_aim_event,
             self._player_return_event,

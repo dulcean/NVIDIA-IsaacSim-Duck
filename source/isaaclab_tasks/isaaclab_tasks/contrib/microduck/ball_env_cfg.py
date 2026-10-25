@@ -155,6 +155,10 @@ class MicroDuckHeadingEnvCfg(DirectRLEnvCfg):
     recovery_min_height_ratio: float = 0.6
     recovery_max_height_offset: float = 0.03
     recovery_max_vertical_speed: float = 0.25
+    post_rally_duration: float = 0.0
+    post_rally_hold: float = 0.2
+    post_rally_reward: float = 0.5
+    miss_cost: float = 0.5
 
     def __post_init__(self):
         self.sim.physics_material = self.scene.terrain.physics_material
@@ -172,3 +176,4 @@ class MicroDuckVolleyEnvCfg(MicroDuckHeadingEnvCfg):
     torso_tilt_cost = 10.0
     torso_tumbling_cost = 0.05
     defer_strike_rewards = True
+    post_rally_duration = 0.6
