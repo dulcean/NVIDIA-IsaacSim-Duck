@@ -109,6 +109,12 @@ a camera-forward/world-up dot product of at least `0.25` are required. The geome
 a camera-direction proxy, not an RGB sensor or an occlusion test. Onset geometry is sampled each
 5 ms physics step, so a brief contact cannot be credited using a later head orientation.
 
+There is no minimum flight time for a legal reply from the other robot: contact onset and alternating
+turn order prevent repeated scoring. `min_transfer_time` limits only the predicted flight horizon for
+the aiming bonus. Robot-to-robot collisions are sampled separately at every physics step and end the
+rally. Strikes in a collision or fall step earn no positive strike/aim/return bonus; collision uses the
+existing fall cost. These changes do not freeze any joints or change the policy's input/action sizes.
+
 Standing with the camera pointed forward and bouncing the ball off the upper lid does not count.
 The look-at-ball reward encourages the neck/head to aim at the approaching ball. All leg joints remain
 trainable; stepping, crouching, jumping, and landing are allowed by the controller. There is no reward
@@ -157,3 +163,45 @@ For small steps of difficulty, increase `env.serve_spread` from `0.01` only afte
 serves, and use `env.separation` to change robot spacing. Use one change per experiment. These are
 configuration overrides, for example `env.serve_spread=0.02`; confirm playback before scaling further.
 There is no automatic difficulty curriculum or pretrained ball-playing policy in this change.
+
+## Diagnose short rallies
+
+Use the following episode metrics alongside deterministic playback:
+
+- `returns`: mean legal replies after the serve; two total strikes correspond to one return.
+- `rally_2_returns`, `rally_4_returns`, `rally_8_returns`: fractions of episodes reaching that many replies.
+- `invalid_head_surface`: the head touched the ball outside the raised, camera-facing forehead rule.
+- `invalid_turn`: a duplicate hit or a hit by the wrong robot.
+- `invalid_body_contact`: the ball hit another robot body.
+- `robot_collision`: robots touched one another.
+- `ball_ground`, `out_of_bounds`, `fell`: other physical ending conditions.
+- `fast_returns`: legal replies arriving sooner than the aiming horizon, formerly rejected by the 80 ms gate.
+
+Failure flags can overlap in the same physics step. A low `fell` value alone does not prove balance:
+an invalid contact can end the episode before the original 70-degree tilt limit is reached.
+Do not start another long run based only on total reward. After updating the rules, keep the old
+checkpoint, run the GPU smoke test, then evaluate that checkpoint and inspect the failure breakdown.
+The collision/turn changes are an exploratory rules correction, not a verified improvement to the
+learned policy. Checkpoint tensors remain compatible; changing the rules still requires GPU rollout
+and learning validation.
+
+To try fine-tuning a saved pair under the corrected rules without overwriting its source run:
+
+```bash
+VOLLEY_CHECKPOINT="$(ls -t logs/rsl_rl/microduck_volley/*/model_*.pt | head -n 1)"
+
+uv run --extra viser isaaclab play \
+  --rl_library rsl_rl --task IsaacContrib-Volley-MicroDuck \
+  --num_envs 4 --viz viser --checkpoint "$VOLLEY_CHECKPOINT"
+
+# After the physical smoke/evaluation checks, try 2000 iterations before deciding on a longer run.
+uv run --extra viser isaaclab train \
+  --rl_library rsl_rl --task IsaacContrib-Volley-MicroDuck \
+  --experiment_name microduck_volley_contact_fix \
+  --num_envs 1024 --max_visible_envs 4 --max_iterations 2000 --viz viser \
+  --checkpoint "$VOLLEY_CHECKPOINT" --no-resume_optimizer_state
+```
+
+This restores the pair's actor/critic weights with a fresh optimizer, rather than converting the
+already-centralized pair again. Use an explicit checkpoint path from the new experiment on later
+play/resume commands, since its experiment directory differs from the task's default.

@@ -15,6 +15,7 @@ from isaaclab.utils.math import quat_apply, quat_apply_inverse
 from isaaclab_assets.robots.microduck import MICRODUCK_JOINT_NAMES
 
 from .ball_env_cfg import MicroDuckHeadingEnvCfg
+from .ball_rules import classify_head_contact, robot_collision_mask
 from .heading_geometry import camera_alignment, front_strike_mask
 
 
@@ -37,6 +38,9 @@ class MicroDuckBallEnv(DirectRLEnv):
         self._robots = [self.scene[f"robot_{name}"] for name in ("a", "b")[: cfg.num_players]]
         self._sensors = [self.scene[f"ball_contacts_{name}"] for name in ("a", "b")[: cfg.num_players]]
         self._ball = self.scene["ball"]
+        self._robot_contacts = self.scene["robot_contacts"] if cfg.num_players == 2 else None
+        if self._robot_contacts is not None and self._robot_contacts.num_filter_objects == 0:
+            raise ValueError("Robot collision sensor must match the other robot's rigid bodies.")
         self._joint_ids = []
         self._play_ids = []
         self._head_ids = []
@@ -82,6 +86,14 @@ class MicroDuckBallEnv(DirectRLEnv):
         self._return_event = torch.zeros_like(self._hits)
         self._aim_event = torch.zeros_like(self._hits)
         self._invalid = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._robot_collision = torch.zeros_like(self._invalid)
+        self._bad_surface = torch.zeros_like(self._invalid)
+        self._bad_turn = torch.zeros_like(self._invalid)
+        self._bad_body = torch.zeros_like(self._invalid)
+        self._ground = torch.zeros_like(self._invalid)
+        self._outside = torch.zeros_like(self._invalid)
+        self._fast_returns = torch.zeros_like(self._hits)
+        self._fast_event = torch.zeros_like(self._hits)
         self._fell = torch.zeros_like(self._invalid)
         self._success = torch.zeros_like(self._invalid)
         self._last_ball_pos = torch.zeros(self.num_envs, 3, device=self.device)
@@ -118,7 +130,9 @@ class MicroDuckBallEnv(DirectRLEnv):
         self._hit_event.zero_()
         self._return_event.zero_()
         self._aim_event.zero_()
+        self._fast_event.zero_()
         self._invalid.zero_()
+        self._robot_collision.zero_()
         self._skip_contact_sample = True
         self._since_hit += self.step_dt
         self._last_ball_pos.copy_(self._ball.data.root_link_pos_w.torch)
@@ -175,6 +189,11 @@ class MicroDuckBallEnv(DirectRLEnv):
 
     def _update_contacts(self):
         """Sample actual contact locations and head orientation at physics-step resolution."""
+        if self._robot_contacts is not None:
+            robot_forces = self._robot_contacts.data.normal_force_matrix_w
+            if robot_forces is None:
+                raise RuntimeError("Filtered robot-to-robot contact forces are required in the volley task.")
+            self._robot_collision |= robot_collision_mask(robot_forces.torch, self.cfg.robot_contact_threshold)
         receivers = self._receivers()
         ball_pos = self._ball.data.root_link_pos_w.torch
         ball_vel = self._ball.data.root_link_lin_vel_w.torch
@@ -207,14 +226,22 @@ class MicroDuckBallEnv(DirectRLEnv):
                 self.cfg.min_camera_up,
             )
             self._raw_hits += onset.float()
-            valid = onset & (self._expected() == i) & ~self._invalid
-            valid &= front_contact
+            valid, wrong_surface, wrong_turn = classify_head_contact(
+                onset,
+                front_contact,
+                self._expected(),
+                self._last_hitter,
+                self._invalid | self._robot_collision,
+                i,
+                self.cfg.num_players,
+            )
             previous = self._last_hitter >= 0
-            if self.cfg.num_players == 1:
-                valid &= ~previous
-            valid &= ~previous | (self._since_hit >= self.cfg.min_transfer_time)
+            self._bad_surface |= wrong_surface
+            self._bad_turn |= wrong_turn
+            self._bad_body |= other_contact
             self._invalid |= other_contact | (onset & ~valid)
             transfer = valid & previous
+            self._fast_event += (transfer & (self._since_hit < self.cfg.min_transfer_time)).float()
             self._hit_event += valid.float()
             self._return_event += transfer.float()
             # Ballistic aim towards the receiver's current head height, on the descending arc.
@@ -231,12 +258,6 @@ class MicroDuckBallEnv(DirectRLEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self._update_contacts()
-        legal = (~self._invalid).float()
-        self._hit_event *= legal
-        self._return_event *= legal
-        self._aim_event *= legal
-        self._hits += self._hit_event
-        self._returns += self._return_event
         relative = self._ball.data.root_link_pos_w.torch - self.scene.env_origins
         self._max_height = torch.maximum(self._max_height, relative[:, 2])
         self._fell.zero_()
@@ -258,6 +279,16 @@ class MicroDuckBallEnv(DirectRLEnv):
                 # Separate half-courts stop robots from meeting under the ball.
                 outside |= root[:, 0] > -0.03 if i == 0 else root[:, 0] < 0.03
         ground = relative[:, 2] <= self.cfg.ball_radius + 0.001
+        self._ground.copy_(ground)
+        self._outside.copy_(outside)
+        # An impact in a collapsing or robot-collision step must not earn a positive strike bonus.
+        legal = (~(self._invalid | self._fell | self._robot_collision | nonfinite)).float()
+        self._hit_event *= legal
+        self._return_event *= legal
+        self._aim_event *= legal
+        self._hits += self._hit_event
+        self._returns += self._return_event
+        self._fast_returns += self._fast_event * legal
         self._success.zero_()
         if self.cfg.num_players == 1:
             # Detect a swept crossing of the virtual receiver's head plane, avoiding control-step tunnelling.
@@ -273,7 +304,7 @@ class MicroDuckBallEnv(DirectRLEnv):
                 & (alpha <= 1)
                 & ((crossing[:, :2] - target[:, :2]).norm(dim=-1) < self.cfg.receiver_radius)
             )
-        failure = ground | outside | nonfinite | self._fell | self._invalid
+        failure = ground | outside | nonfinite | self._fell | self._invalid | self._robot_collision
         self._success &= ~failure
         died = failure | self._success
         return died, self.episode_length_buf >= self.max_episode_length - 1
@@ -311,7 +342,7 @@ class MicroDuckBallEnv(DirectRLEnv):
             + self.cfg.hit_reward * self._hit_event
             + self.cfg.aim_reward * self._aim_event
             + self.cfg.transfer_reward * (self._return_event + self._success.float())
-            - self.cfg.fall_cost * self._fell.float()
+            - self.cfg.fall_cost * (self._fell | self._robot_collision).float()
             - self._invalid.float()
         )
         return torch.nan_to_num(reward, nan=-self.cfg.fall_cost, posinf=0.0, neginf=-self.cfg.fall_cost)
@@ -327,9 +358,19 @@ class MicroDuckBallEnv(DirectRLEnv):
                     self._gaze_sum[env_ids] / self.episode_length_buf[env_ids].clamp_min(1)
                 ).mean(),
                 "Metrics/returns": self._returns[env_ids].mean(),
+                "Metrics/rally_2_returns": (self._returns[env_ids] >= 2).float().mean(),
+                "Metrics/rally_4_returns": (self._returns[env_ids] >= 4).float().mean(),
+                "Metrics/rally_8_returns": (self._returns[env_ids] >= 8).float().mean(),
+                "Metrics/fast_returns": self._fast_returns[env_ids].mean(),
                 "Metrics/target_success": self._success[env_ids].float().mean(),
                 "Metrics/fell": self._fell[env_ids].float().mean(),
                 "Metrics/invalid_contact": self._invalid[env_ids].float().mean(),
+                "Metrics/invalid_head_surface": self._bad_surface[env_ids].float().mean(),
+                "Metrics/invalid_turn": self._bad_turn[env_ids].float().mean(),
+                "Metrics/invalid_body_contact": self._bad_body[env_ids].float().mean(),
+                "Metrics/robot_collision": self._robot_collision[env_ids].float().mean(),
+                "Metrics/ball_ground": self._ground[env_ids].float().mean(),
+                "Metrics/out_of_bounds": self._outside[env_ids].float().mean(),
                 "Metrics/max_ball_height": self._max_height[env_ids].mean(),
             }
         super()._reset_idx(env_ids)
@@ -376,6 +417,14 @@ class MicroDuckBallEnv(DirectRLEnv):
             self._return_event,
             self._aim_event,
             self._invalid,
+            self._robot_collision,
+            self._bad_surface,
+            self._bad_turn,
+            self._bad_body,
+            self._ground,
+            self._outside,
+            self._fast_returns,
+            self._fast_event,
             self._fell,
             self._success,
             self._max_height,

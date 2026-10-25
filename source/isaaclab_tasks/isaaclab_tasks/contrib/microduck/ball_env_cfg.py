@@ -76,6 +76,12 @@ class MicroDuckVolleySceneCfg(MicroDuckHeadingSceneCfg):
         ),
     )
     ball_contacts_b = MicroDuckHeadingSceneCfg().ball_contacts_a.replace(prim_path="{ENV_REGEX_NS}/RobotB/Geometry/.*")
+    robot_contacts = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/RobotA/Geometry/.*",
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/RobotB/Geometry/.*"],
+        history_length=1,
+        update_period=0.005,
+    )
 
 
 @configclass
@@ -126,6 +132,8 @@ class MicroDuckHeadingEnvCfg(DirectRLEnvCfg):
     min_camera_cosine: float = 0.5
     min_camera_up: float = 0.25
     contact_threshold: float = 0.001
+    robot_contact_threshold: float = 0.01
+    # Minimum predicted flight horizon for the aiming bonus, not a ban on fast replies.
     min_transfer_time: float = 0.08
     approach_reward_scale: float = 0.2
     gaze_reward_scale: float = 0.2
