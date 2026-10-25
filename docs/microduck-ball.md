@@ -175,6 +175,7 @@ Use the following episode metrics alongside deterministic playback:
 - `invalid_body_contact`: the ball hit another robot body.
 - `robot_collision`: robots touched one another.
 - `ball_ground`, `out_of_bounds`, `fell`: other physical ending conditions.
+- `ball_out_of_bounds`, `robot_out_of_bounds`, `crossed_center`: the three components of `out_of_bounds`.
 - `fast_returns`: legal replies arriving sooner than the aiming horizon, formerly rejected by the 80 ms gate.
 
 Failure flags can overlap in the same physics step. A low `fell` value alone does not prove balance:
@@ -205,3 +206,52 @@ uv run --extra viser isaaclab train \
 This restores the pair's actor/critic weights with a fresh optimizer, rather than converting the
 already-centralized pair again. Use an explicit checkpoint path from the new experiment on later
 play/resume commands, since its experiment directory differs from the task's default.
+
+## Check scene scale and passive ball physics before another long run
+
+The original small-scene settings use 0.35 m root separation and a serve 0.25 m above the forehead,
+already moving down at 0.2 m/s. Ignoring the small contact radius/forehead-shape correction, free fall
+through 0.25 m takes about 0.206 s and arrives at about 2.22 m/s. This is only about ten policy updates
+at 50 Hz. Close robot spacing also permits quick exchanges while lunging towards the center. A wider
+court is an experiment requiring policy adaptation, not a guaranteed fix to an already learned lunge.
+
+First measure the **same** ball mass, collider, contact parameters, solver, and floor without robots,
+policy actions, reward logic, or automatic episode resets:
+
+```bash
+uv run python scripts/tools/check_microduck_ball_physics.py
+```
+
+The utility prints a JSON report and saves `logs/microduck_ball_physics.json` and a `.csv` trace.
+It reports actual mass/inertia, acceleration, ballistic position error, sampled restitution, and first
+rebound height. A passing report establishes basic passive physical consistency; it does not establish
+that the ball is calibrated to a real object or that moving-head contacts are correct. A failed report
+must be inspected before contact parameters are tuned. In particular, non-positive inertia, incorrect
+gravity, or energy gain in a passive bounce cannot be attributed to the policy.
+
+For a timestep comparison, keep all other parameters fixed:
+
+```bash
+uv run python scripts/tools/check_microduck_ball_physics.py \
+  --dt 0.0025 --output logs/microduck_ball_physics_half_dt.json
+```
+
+After inspecting that report, use a single-environment playback to inspect more breathing room and
+a higher, initially stationary serve:
+
+```bash
+CHECKPOINT="$(ls -t logs/rsl_rl/microduck_volley_contact_fix/*/model_*.pt | head -n 1)"
+
+uv run --extra viser isaaclab play \
+  --rl_library rsl_rl --task IsaacContrib-Volley-MicroDuck \
+  --num_envs 1 --viz viser --checkpoint "$CHECKPOINT" \
+  env.separation=0.5 env.serve_height=0.45 env.serve_down_speed=0.0
+```
+
+This changes scene geometry/serve timing together for visual inspection, so it is exploratory rather
+than an isolated learning comparison. It does not change ball mass, contact damping, gravity, or fix
+the robot legs. The stationary 0.45 m drop gives about 0.303 s before the nominal forehead height but
+also increases impact speed to about 2.97 m/s. A higher serve is not automatically an easier strike.
+Do not replace the existing checkpoint or start another long run solely because the new scene looks
+more spacious. Use the physical report, boundary breakdown, and recovery behavior to select the next
+single-variable training experiment.

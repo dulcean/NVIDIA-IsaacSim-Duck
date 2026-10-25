@@ -92,6 +92,9 @@ class MicroDuckBallEnv(DirectRLEnv):
         self._bad_body = torch.zeros_like(self._invalid)
         self._ground = torch.zeros_like(self._invalid)
         self._outside = torch.zeros_like(self._invalid)
+        self._ball_outside = torch.zeros_like(self._invalid)
+        self._robot_outside = torch.zeros_like(self._invalid)
+        self._crossed_center = torch.zeros_like(self._invalid)
         self._fast_returns = torch.zeros_like(self._hits)
         self._fast_event = torch.zeros_like(self._hits)
         self._fell = torch.zeros_like(self._invalid)
@@ -263,9 +266,11 @@ class MicroDuckBallEnv(DirectRLEnv):
         self._fell.zero_()
         nonfinite = ~torch.isfinite(self._ball.data.root_link_vel_w.torch).all(dim=-1)
         nonfinite |= ~torch.isfinite(relative).all(dim=-1)
-        outside = (relative[:, 0].abs() > self.cfg.court_half_length) | (
+        ball_outside = (relative[:, 0].abs() > self.cfg.court_half_length) | (
             relative[:, 1].abs() > self.cfg.court_half_width
         )
+        robot_outside = torch.zeros_like(ball_outside)
+        crossed_center = torch.zeros_like(ball_outside)
         for i, robot in enumerate(self._robots):
             self._fell |= robot.data.projected_gravity_b.torch[:, 2] > -0.35
             nonfinite |= ~torch.isfinite(robot.data.joint_pos.torch).all(dim=-1)
@@ -274,13 +279,19 @@ class MicroDuckBallEnv(DirectRLEnv):
             nonfinite |= ~torch.isfinite(robot.data.root_link_vel_w.torch).all(dim=-1)
             root = robot.data.root_link_pos_w.torch - self.scene.env_origins
             nonfinite |= ~torch.isfinite(root).all(dim=-1)
-            outside |= (root[:, 1].abs() > self.cfg.court_half_width) | (root[:, 0].abs() > self.cfg.court_half_length)
+            robot_outside |= (root[:, 1].abs() > self.cfg.court_half_width) | (
+                root[:, 0].abs() > self.cfg.court_half_length
+            )
             if self.cfg.num_players == 2:
                 # Separate half-courts stop robots from meeting under the ball.
-                outside |= root[:, 0] > -0.03 if i == 0 else root[:, 0] < 0.03
+                crossed_center |= root[:, 0] > -0.03 if i == 0 else root[:, 0] < 0.03
+        outside = ball_outside | robot_outside | crossed_center
         ground = relative[:, 2] <= self.cfg.ball_radius + 0.001
         self._ground.copy_(ground)
         self._outside.copy_(outside)
+        self._ball_outside.copy_(ball_outside)
+        self._robot_outside.copy_(robot_outside)
+        self._crossed_center.copy_(crossed_center)
         # An impact in a collapsing or robot-collision step must not earn a positive strike bonus.
         legal = (~(self._invalid | self._fell | self._robot_collision | nonfinite)).float()
         self._hit_event *= legal
@@ -371,6 +382,9 @@ class MicroDuckBallEnv(DirectRLEnv):
                 "Metrics/robot_collision": self._robot_collision[env_ids].float().mean(),
                 "Metrics/ball_ground": self._ground[env_ids].float().mean(),
                 "Metrics/out_of_bounds": self._outside[env_ids].float().mean(),
+                "Metrics/ball_out_of_bounds": self._ball_outside[env_ids].float().mean(),
+                "Metrics/robot_out_of_bounds": self._robot_outside[env_ids].float().mean(),
+                "Metrics/crossed_center": self._crossed_center[env_ids].float().mean(),
                 "Metrics/max_ball_height": self._max_height[env_ids].mean(),
             }
         super()._reset_idx(env_ids)
@@ -423,6 +437,9 @@ class MicroDuckBallEnv(DirectRLEnv):
             self._bad_body,
             self._ground,
             self._outside,
+            self._ball_outside,
+            self._robot_outside,
+            self._crossed_center,
             self._fast_returns,
             self._fast_event,
             self._fell,
