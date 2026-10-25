@@ -209,6 +209,65 @@ play/resume commands, since its experiment directory differs from the task's def
 
 ## Check scene scale and passive ball physics before another long run
 
+### Fine-tune recovery on the original scene
+
+The volley task pays only `0.2` immediately for each legal strike. The other `0.8`,
+the aiming bonus (up to `2`), and the return bonus (`5` after the first strike) are
+banked for the player who made that strike. They are paid once after at least
+`0.12 s` since that player's latest strike and `0.10 s` of continuous recovery:
+
+- Torso tilt at most 20 degrees, combined roll/pitch speed at most `1.5 rad/s`.
+- Root height from `0.6 * initial height` to `initial height + 0.03 m`.
+- Absolute vertical speed at most `0.25 m/s`.
+
+The height/speed checks are a landing proxy, not a foot-to-floor contact measurement.
+Jumping and head motion remain unrestricted; airborne motion simply delays payment.
+A new own strike restarts the recovery clock and retains banked credit; a partner's
+strike does not restart it. Any terminal step (including ball exits and timeouts)
+cancels all unpaid credit, taking priority over recovery on that same step. Reset
+clears the bank only for the affected worlds. Previously paid rewards are not revoked
+if the robot falls later; the recovery window is finite.
+
+Two legal strikes with no recovery now receive only `0.4` in immediate strike bonuses.
+If followed by a registered fall/collision/robot court exit (`-2`), their sparse subtotal
+is `-1.6`, before dense terms. Two fully recovered strikes still receive `7` to `11`
+in total strike/aim/return bonuses, before discounting. A ball exit alone has no `-2`
+fall cost, but forfeits outstanding credit. This discourages the observed shortcut;
+it does not prove that a learned policy will recover or that every short rally loses reward.
+The single-player heading task keeps its immediate strike rewards.
+
+The volley task also charges a continuous cost for the least balanced player's torso:
+`10 * (1 - cos(tilt)) + 0.05 * (roll_rate**2 + pitch_rate**2)` per second.
+Each term takes the maximum over both players. Head orientation, yaw, root height,
+and vertical speed are not penalized by these terms; leg control and jumping remain available.
+Robot court exits and center-line violations also incur the existing fall cost and suppress
+positive strike bonuses on that step. Ball exits retain their existing termination behavior.
+This is an experimental reward correction, not a GPU-verified recovery skill.
+
+Keep the original spacing and serve while testing this objective. Start with a short continuation
+from the existing pair, with a fresh optimizer in a separate experiment:
+
+```bash
+CHECKPOINT="$(ls -t logs/rsl_rl/microduck_volley_contact_fix/*/model_*.pt | head -n 1)"
+nohup uv run --extra viser isaaclab train \
+  --rl_library rsl_rl --task IsaacContrib-Volley-MicroDuck \
+  --experiment_name microduck_volley_recovery \
+  --num_envs 1024 --max_visible_envs 4 --max_iterations 500 --viz viser \
+  --checkpoint "$CHECKPOINT" --no-resume_optimizer_state \
+  env.separation=0.35 env.serve_height=0.25 env.serve_down_speed=0.2 \
+  > volley_recovery.log 2>&1 < /dev/null &
+```
+
+Inspect a checkpoint from `logs/rsl_rl/microduck_volley_recovery/` explicitly during playback.
+`Metrics/recovered_hits` counts strikes whose banked credit was paid; compare it with
+`Metrics/head_hits`. `Metrics/recovery_reward` is the mean sum of paid banked credit per episode.
+Compare returns, rally counts, episode length, robot exits, center crossings, and falling,
+alongside visible recovery after each strike. Standing still with fewer returns is not success.
+Do not widen the scene or change ball physics in this comparison. To reproduce the old volley
+reward for an ablation, set `env.defer_strike_rewards=false` and both torso costs to zero;
+the boundary failure correction still applies. Observation/action sizes are unchanged, so the old
+pair checkpoint remains loadable; reward semantics changed, so use a fresh optimizer and a new run.
+
 The original small-scene settings use 0.35 m root separation and a serve 0.25 m above the forehead,
 already moving down at 0.2 m/s. Ignoring the small contact radius/forehead-shape correction, free fall
 through 0.25 m takes about 0.206 s and arrives at about 2.22 m/s. This is only about ten policy updates

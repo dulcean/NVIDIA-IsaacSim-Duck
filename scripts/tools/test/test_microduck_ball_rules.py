@@ -56,3 +56,100 @@ def test_robot_contacts_do_not_cancel_or_count_subthreshold_noise():
     forces[2, 0, 0, 2] = 0.005
     forces[3, 0, 0, 2] = float("nan")
     assert rules.robot_collision_mask(forces, 0.01).tolist() == [True, False, False, True]
+
+
+def test_balance_detects_either_partner_tumbling_but_allows_yaw():
+    """One standing partner must not mask a collapsing torso; turning in place remains allowed."""
+    gravity = torch.tensor(
+        [
+            [[0.0, 0.0, -1.0], [0.0, 0.0, -1.0]],
+            [[0.8660254, 0.0, -0.5], [0.0, 0.0, -1.0]],
+            [[0.0, 0.0, -1.0], [0.0, 0.0, 1.0]],
+        ]
+    )
+    angular = torch.zeros(3, 2, 3)
+    angular[0, :, 2] = 5.0
+    angular[1, 0, 1] = 3.0
+    angular[2, 1, 0] = 2.0
+    tilt, tumbling = rules.balance_errors(gravity, angular)
+    torch.testing.assert_close(tilt, torch.tensor([0.0, 0.5, 2.0]))
+    torch.testing.assert_close(tumbling, torch.tensor([0.0, 9.0, 4.0]))
+
+
+def test_recovery_conserves_strike_credit_and_pays_only_once():
+    """Two recovered strikes retain the original seven-point budget, including immediate credit."""
+    state = rules.RecoveryRewards(1, 2, "cpu")
+    credit = torch.tensor([[0.8, 5.8]])
+    hits = torch.ones_like(credit)
+    stable = torch.ones_like(credit, dtype=torch.bool)
+    ended = torch.tensor([False])
+    paid, recovered = state.step(credit, hits, stable, ended, 0.02, 0.12, 0.10)
+    assert paid.sum() == 0 and recovered.sum() == 0
+    for _ in range(5):
+        paid, _ = state.step(credit * 0, hits * 0, stable, ended, 0.02, 0.12, 0.10)
+        assert paid.sum() == 0
+    paid, recovered = state.step(credit * 0, hits * 0, stable, ended, 0.02, 0.12, 0.10)
+    torch.testing.assert_close(paid.sum() + 0.4, torch.tensor(7.0))
+    assert recovered.sum() == 2
+    for _ in range(10):
+        paid, recovered = state.step(credit * 0, hits * 0, stable, ended, 0.02, 0.12, 0.10)
+        assert paid.sum() == 0 and recovered.sum() == 0
+
+
+def test_terminal_step_cancels_credit_even_when_recovery_is_ready():
+    """Neither a terminal strike nor a failure at payout time may cash unpaid bonuses."""
+    state = rules.RecoveryRewards(2, 2, "cpu")
+    credit = torch.tensor([[0.8, 5.8], [0.8, 5.8]])
+    hits = torch.ones_like(credit)
+    stable = torch.ones_like(credit, dtype=torch.bool)
+    ongoing = torch.zeros(2, dtype=torch.bool)
+    state.step(credit, hits, stable, ongoing, 0.02, 0.12, 0.10)
+    for _ in range(5):
+        state.step(credit * 0, hits * 0, stable, ongoing, 0.02, 0.12, 0.10)
+    paid, recovered = state.step(credit * 0, hits * 0, stable, torch.tensor([True, False]), 0.02, 0.12, 0.10)
+    assert paid[0].sum() == 0 and recovered[0].sum() == 0
+    torch.testing.assert_close(paid[1].sum(), torch.tensor(6.6))
+    # Two immediate hit bonuses followed by a fall cannot profit from aim or return credit.
+    assert 0.4 + paid[0].sum() - 2.0 < 0
+    paid, _ = state.step(credit, hits, stable, ~ongoing, 0.02, 0.12, 0.10)
+    assert paid.sum() == 0 and state.pending.sum() == 0
+
+
+def test_recovery_requires_continuous_stability_for_each_player_and_resets_per_world():
+    """A balanced partner cannot unlock another player's credit; resetting one world cannot erase another."""
+    state = rules.RecoveryRewards(2, 2, "cpu")
+    credit = torch.ones(2, 2)
+    hits = torch.ones_like(credit)
+    stable = torch.ones_like(credit, dtype=torch.bool)
+    ongoing = torch.zeros(2, dtype=torch.bool)
+    state.step(credit, hits, stable, ongoing, 0.02, 0.12, 0.10)
+    for _ in range(4):
+        state.step(credit * 0, hits * 0, stable, ongoing, 0.02, 0.12, 0.10)
+    stable[:, 1] = False
+    state.step(credit * 0, hits * 0, stable, ongoing, 0.02, 0.12, 0.10)
+    stable[:, 1] = True
+    paid, recovered = state.step(credit * 0, hits * 0, stable, ongoing, 0.02, 0.12, 0.10)
+    torch.testing.assert_close(paid, torch.tensor([[1.0, 0.0], [1.0, 0.0]]))
+    assert recovered.sum() == 2
+    state.reset(torch.tensor([0]))
+    for _ in range(4):
+        paid, _ = state.step(credit * 0, hits * 0, stable, ongoing, 0.02, 0.12, 0.10)
+    torch.testing.assert_close(paid, torch.tensor([[0.0, 0.0], [0.0, 1.0]]))
+
+
+def test_another_own_strike_restarts_recovery_without_losing_credit():
+    """Rapid repeated exchanges bank credit but cannot use stability preceding the newest own hit."""
+    state = rules.RecoveryRewards(1, 1, "cpu")
+    credit = torch.ones(1, 1)
+    stable = torch.ones(1, 1, dtype=torch.bool)
+    ended = torch.tensor([False])
+    state.step(credit, credit, stable, ended, 0.02, 0.12, 0.10)
+    for _ in range(5):
+        state.step(credit * 0, credit * 0, stable, ended, 0.02, 0.12, 0.10)
+    paid, _ = state.step(credit, credit, stable, ended, 0.02, 0.12, 0.10)
+    assert paid.sum() == 0
+    for _ in range(5):
+        paid, _ = state.step(credit * 0, credit * 0, stable, ended, 0.02, 0.12, 0.10)
+        assert paid.sum() == 0
+    paid, recovered = state.step(credit * 0, credit * 0, stable, ended, 0.02, 0.12, 0.10)
+    assert paid.sum() == 2 and recovered.sum() == 2

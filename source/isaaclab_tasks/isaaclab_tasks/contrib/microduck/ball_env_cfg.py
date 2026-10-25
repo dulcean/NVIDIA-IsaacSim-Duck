@@ -138,12 +138,23 @@ class MicroDuckHeadingEnvCfg(DirectRLEnvCfg):
     approach_reward_scale: float = 0.2
     gaze_reward_scale: float = 0.2
     upright_reward_scale: float = 0.1
+    torso_tilt_cost: float = 0.0
+    torso_tumbling_cost: float = 0.0
     action_rate_cost: float = 0.01
     joint_limit_cost: float = 0.2
     fall_cost: float = 2.0
     hit_reward: float = 1.0
     aim_reward: float = 2.0
     transfer_reward: float = 5.0
+    defer_strike_rewards: bool = False
+    immediate_hit_fraction: float = 0.2
+    recovery_delay: float = 0.12
+    recovery_hold: float = 0.10
+    recovery_min_upright: float = 0.9396926  # cos(20 degrees), measured on the torso, not the head.
+    recovery_max_tumbling: float = 1.5  # Combined roll/pitch rate in rad/s; yaw is unrestricted.
+    recovery_min_height_ratio: float = 0.6
+    recovery_max_height_offset: float = 0.03
+    recovery_max_vertical_speed: float = 0.25
 
     def __post_init__(self):
         self.sim.physics_material = self.scene.terrain.physics_material
@@ -158,3 +169,6 @@ class MicroDuckVolleyEnvCfg(MicroDuckHeadingEnvCfg):
     action_space = 28
     observation_space = 142
     episode_length_s = 12.0
+    torso_tilt_cost = 10.0
+    torso_tumbling_cost = 0.05
+    defer_strike_rewards = True
