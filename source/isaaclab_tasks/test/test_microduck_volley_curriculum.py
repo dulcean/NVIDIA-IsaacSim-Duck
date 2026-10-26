@@ -135,6 +135,15 @@ def test_curriculum_physical_serve_support_control_and_partial_reset(device):
         }
         assert all(records[0][key] == value for key, value in expected.items())
         assert records[0]["goal_reached"] is False
+        assert records[0]["head_hits"] == 0 and records[0]["head_contacts"] == 0
+        assert records[0]["recovered_miss"] is False
+        assert records[0]["recovery_stable_by_player"][0] is False
+        assert len(records[0]["recovery_stable_by_player"]) == 2
+        assert records[0]["recovery_hold_s"] == 0.0
+        assert "tilt" in records[0]["unsafe_reasons"]
+        assert records[0]["miss_reasons"] == ["ball_outside"]
+        assert extras["log"]["Metrics/unsafe_tilt"] == 1.0
+        assert extras["log"]["Metrics/ball_outside"] == 1.0
         assert torch.isfinite(obs["policy"]).all() and torch.isfinite(reward).all()
 
         # Reuse this one physical fixture: later lessons change the reset

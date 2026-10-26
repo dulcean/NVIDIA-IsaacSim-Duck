@@ -21,6 +21,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 CURRICULUM_PROFILE = "microduck_volley_curriculum_v1"
+VISION_PROFILE = "microduck_volley_vision_v1"
 
 
 def _curriculum_module():
@@ -64,6 +65,31 @@ def _validate_record(record: dict, stage: int, spec):
         quality = record["launch_quality"]
         if type(quality) not in (int, float) or not math.isfinite(quality) or quality < 0:
             raise ValueError("The optional launch-quality diagnostic must be finite and non-negative.")
+    for name in ("head_hits", "head_contacts"):
+        if name in record and (type(record[name]) is not int or record[name] < 0):
+            raise ValueError("Contact diagnostics must be non-negative integer counts.")
+    if "recovered_miss" in record:
+        if type(record["recovered_miss"]) is not bool:
+            raise ValueError("The recovered-miss diagnostic must be a boolean.")
+        if record["recovered_miss"] and (record["success"] or record["unsafe"]):
+            raise ValueError("A recovered miss cannot also be a success or an unsafe episode.")
+    if "recovery_stable_by_player" in record:
+        stable = record["recovery_stable_by_player"]
+        if not isinstance(stable, (list, tuple)) or len(stable) != 2 or any(type(v) is not bool for v in stable):
+            raise ValueError("Recovery diagnostics must include a boolean for each player.")
+    if "recovery_hold_s" in record:
+        hold = record["recovery_hold_s"]
+        if type(hold) not in (int, float) or not math.isfinite(hold) or hold < 0:
+            raise ValueError("The recovery hold must be finite and non-negative.")
+    for name in ("unsafe_reasons", "miss_reasons"):
+        if name in record:
+            reasons = record[name]
+            if (
+                not isinstance(reasons, (list, tuple))
+                or any(not isinstance(reason, str) or not reason for reason in reasons)
+                or len(set(reasons)) != len(reasons)
+            ):
+                raise ValueError("Diagnostic reasons must be unique, non-empty strings.")
 
 
 def evaluate_policy(
@@ -180,6 +206,35 @@ def evaluate_policy(
         "max_steps_reached": not complete,
         "scope": "Fixed held-out episode cohorts; true physical stage success including final recovery.",
     }
+    diagnostic_fields = (
+        "head_hits",
+        "head_contacts",
+        "recovered_miss",
+        "recovery_stable_by_player",
+        "recovery_hold_s",
+        "unsafe_reasons",
+        "miss_reasons",
+    )
+    diagnosed = [record for record in records if all(name in record for name in diagnostic_fields)]
+    metrics["diagnostic_episodes"] = len(diagnosed)
+    if diagnosed:
+        count = len(diagnosed)
+        metrics.update(
+            mean_head_hits=sum(record["head_hits"] for record in diagnosed) / count,
+            head_hit_rate=sum(record["head_hits"] > 0 for record in diagnosed) / count,
+            mean_head_contacts=sum(record["head_contacts"] for record in diagnosed) / count,
+            recovered_miss_rate=sum(record["recovered_miss"] for record in diagnosed) / count,
+            recovery_stable_rate_by_player=[
+                sum(record["recovery_stable_by_player"][player] for record in diagnosed) / count for player in (0, 1)
+            ],
+            recovery_stable_rate_by_role={
+                role: sum(record["recovery_stable_by_player"][record["server"] ^ other] for record in diagnosed) / count
+                for role, other in (("receiver", 0), ("partner", 1))
+            },
+            mean_recovery_hold_s=sum(record["recovery_hold_s"] for record in diagnosed) / count,
+            unsafe_reasons=dict(Counter(reason for record in diagnosed for reason in record["unsafe_reasons"])),
+            miss_reasons=dict(Counter(reason for record in diagnosed for reason in record["miss_reasons"])),
+        )
     return report, metrics
 
 
@@ -191,8 +246,9 @@ def collect(args: argparse.Namespace) -> dict:
     wp.config.enable_backward = False
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     metadata = (checkpoint.get("infos") or {}).get("microduck_curriculum", {})
-    if metadata.get("profile") != CURRICULUM_PROFILE:
-        raise ValueError("Convert the source checkpoint with prepare_microduck_curriculum_checkpoint.py first.")
+    profile = metadata.get("profile")
+    if profile not in (CURRICULUM_PROFILE, VISION_PROFILE):
+        raise ValueError("Convert the source checkpoint for the curriculum or vision task first.")
     stage = args.stage
     if stage is None:
         stage = metadata.get("curriculum_state", metadata.get("state", {})).get("stage", metadata.get("stage"))
@@ -207,23 +263,33 @@ def collect(args: argparse.Namespace) -> dict:
 
     from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
-    from isaaclab_tasks.contrib.microduck.agents.ball_ppo_cfg import MicroDuckVolleyCurriculumPPORunnerCfg
-    from isaaclab_tasks.contrib.microduck.volley_curriculum_env import MicroDuckVolleyCurriculumEnv
-    from isaaclab_tasks.contrib.microduck.volley_curriculum_env_cfg import MicroDuckVolleyCurriculumEnvCfg
+    if profile == VISION_PROFILE:
+        from isaaclab_tasks.contrib.microduck.agents.ball_ppo_cfg import MicroDuckVolleyVisionPPORunnerCfg as AgentCfg
+        from isaaclab_tasks.contrib.microduck.volley_vision_env import MicroDuckVolleyVisionEnv as Environment
+        from isaaclab_tasks.contrib.microduck.volley_vision_env_cfg import MicroDuckVolleyVisionEnvCfg as EnvCfg
+    else:
+        from isaaclab_tasks.contrib.microduck.agents.ball_ppo_cfg import (
+            MicroDuckVolleyCurriculumPPORunnerCfg as AgentCfg,
+        )
+        from isaaclab_tasks.contrib.microduck.volley_curriculum_env import MicroDuckVolleyCurriculumEnv as Environment
+        from isaaclab_tasks.contrib.microduck.volley_curriculum_env_cfg import MicroDuckVolleyCurriculumEnvCfg as EnvCfg
 
-    cfg = MicroDuckVolleyCurriculumEnvCfg()
+    cfg = EnvCfg()
     cfg.scene.num_envs = args.num_envs
     cfg.sim.visualizer_cfgs = []
     cfg.seed = args.seed
     cfg.curriculum_stage = stage
     cfg.evaluation = True
-    agent = MicroDuckVolleyCurriculumPPORunnerCfg()
+    agent = AgentCfg()
     agent.device = args.device
     agent.seed = args.seed
     with launch_simulation(cfg.sim, {"device": args.device, "visualizer": ["none"]}):
         sim_utils.create_new_stage()
-        env = MicroDuckVolleyCurriculumEnv(cfg)
+        env = Environment(cfg)
         try:
+            if profile == VISION_PROFILE and "vision_contract" in metadata:
+                if metadata["vision_contract"] != env.vision_contract():
+                    raise ValueError("Saved visual observation/camera contract differs from this environment.")
             env.set_evaluation(True, seed=args.seed)
             wrapped = RslRlVecEnvWrapper(env, clip_actions=agent.clip_actions)
             runner = OnPolicyRunner(wrapped, to_dict(agent), log_dir=None, device=agent.device)
@@ -244,8 +310,11 @@ def collect(args: argparse.Namespace) -> dict:
                     "physics_dt_s": cfg.sim.dt,
                     "policy_dt_s": env.step_dt,
                     "separation_m": cfg.separation,
+                    "profile": profile,
                 }
             )
+            if profile == VISION_PROFILE:
+                metrics["vision"] = env.vision_diagnostics()
             return metrics
         finally:
             env.close()

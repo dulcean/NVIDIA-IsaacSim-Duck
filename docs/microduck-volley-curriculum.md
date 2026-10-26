@@ -1,5 +1,8 @@
 # MicroDuck volleyball curriculum
 
+For actual head RGB sensors, pixel-based ball tracking and the separate visual actor,
+see [MicroDuck head cameras](microduck-vision.md). This page describes the simulator-state teacher.
+
 One driver prepares weights, trains receive/return/recover lessons, checks physical outcomes,
 and progresses to an unassisted pair. Legacy tasks/checkpoints remain available.
 This is an implemented protocol, **not a GPU-verified learned policy**. CPU tests cannot
@@ -138,6 +141,31 @@ uv run python scripts/tools/evaluate_microduck_volley.py \
   --checkpoint logs/rsl_rl/microduck_volley_curriculum/RUN/ready.pt \
   --stage 5 --seed 5000042
 ```
+
+If a lesson stays at zero success, evaluate its existing checkpoint before spending
+another training budget. No conversion or optimizer update is needed:
+
+```bash
+uv run python scripts/tools/evaluate_microduck_volley.py \
+  --checkpoint logs/rsl_rl/microduck_volley_curriculum/RUN/latest.pt \
+  --num-envs 128 --output logs/microduck_curriculum_diagnosis.json
+```
+
+`returns=0` is expected in coach stages 0–2; it counts alternating contacts only in pair
+stages. Use `head_hit_rate` / `mean_head_contacts` to distinguish missed balls and invalid
+head contacts, `goal_reached_rate` for actual target crossings, and
+`recovery_stable_rate_by_role` for the initial receiver versus its partner. Terminal
+stability is an instantaneous diagnostic; `mean_recovery_hold_s` and `recovered_miss_rate`
+measure the uninterrupted hold and full recovery after a miss. Recovered misses never
+count as successful volleys. `unsafe_reasons` and `miss_reasons` are overlapping episode
+counts, so their sum can exceed the number of episodes. `diagnostic_episodes` states how
+many fixed-cohort episodes contain the extended diagnostics. Training logs expose the
+same contact/goal/recovery breakdown and individual failure rates.
+
+Exit code 1 means that the evaluated checkpoint failed its skill gate, with the JSON report
+still saved. Diagnostics are additive: existing curriculum weights and full `--resume`
+checkpoints remain compatible. The reward, reset distributions, observations and physical
+success criteria are unchanged by these diagnostics.
 
 CPU tests cover serve geometry, swept targets, conversion/trainability, episode priority,
 evaluation cohort bias, advancement/resume and physical checkpoint selection. The GPU test

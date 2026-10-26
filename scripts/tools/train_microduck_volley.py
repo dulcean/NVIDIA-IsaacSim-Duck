@@ -88,6 +88,36 @@ def resume_metadata(checkpoint, profile):
     return metadata
 
 
+def _task_components(vision):
+    """Load one complete observation/profile contract before constructing the simulation."""
+    if vision:
+        from isaaclab_tasks.contrib.microduck.agents.ball_ppo_cfg import MicroDuckVolleyVisionPPORunnerCfg as AgentCfg
+        from isaaclab_tasks.contrib.microduck.volley_vision_env import MicroDuckVolleyVisionEnv as Environment
+        from isaaclab_tasks.contrib.microduck.volley_vision_env_cfg import MicroDuckVolleyVisionEnvCfg as EnvCfg
+
+        prepare = _tool("prepare_microduck_vision_checkpoint")
+        prepare_weights = prepare.prepare_vision_checkpoint
+        profile = prepare.VISION_PROFILE
+        experiment = "microduck_volley_vision"
+    else:
+        from isaaclab_tasks.contrib.microduck.agents.ball_ppo_cfg import (
+            MicroDuckVolleyCurriculumPPORunnerCfg as AgentCfg,
+        )
+        from isaaclab_tasks.contrib.microduck.volley_curriculum_env import MicroDuckVolleyCurriculumEnv as Environment
+        from isaaclab_tasks.contrib.microduck.volley_curriculum_env_cfg import MicroDuckVolleyCurriculumEnvCfg as EnvCfg
+
+        prepare = _tool("prepare_microduck_curriculum_checkpoint")
+        prepare_weights = prepare.prepare_curriculum_checkpoint
+        profile = prepare.CURRICULUM_PROFILE
+        experiment = "microduck_volley_curriculum"
+    return EnvCfg, Environment, AgentCfg, prepare_weights, profile, experiment
+
+
+def _vision_metrics(env, vision):
+    """Keep runtime perception diagnostics separate from curriculum outcome counts."""
+    return {"vision": env.vision_diagnostics()} if vision else {}
+
+
 def train(args):
     """Use one environment pool for learning and fixed-cohort evaluation, with independent RNG streams."""
     import warp as wp
@@ -103,17 +133,12 @@ def train(args):
 
     from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
-    from isaaclab_tasks.contrib.microduck.agents.ball_ppo_cfg import MicroDuckVolleyCurriculumPPORunnerCfg
     from isaaclab_tasks.contrib.microduck.volley_curriculum import CurriculumState
-    from isaaclab_tasks.contrib.microduck.volley_curriculum_env import MicroDuckVolleyCurriculumEnv
-    from isaaclab_tasks.contrib.microduck.volley_curriculum_env_cfg import MicroDuckVolleyCurriculumEnvCfg
 
-    prepare = _tool("prepare_microduck_curriculum_checkpoint")
+    EnvCfg, Environment, AgentCfg, prepare_weights, profile, experiment = _task_components(args.vision)
     evaluator = _tool("evaluate_microduck_volley")
     state = CurriculumState(min_attempts_per_side=args.eval_episodes_per_side)
-    run_dir = args.output or Path("logs/rsl_rl/microduck_volley_curriculum") / datetime.now().strftime(
-        "%Y-%m-%d_%H-%M-%S-%f"
-    )
+    run_dir = args.output or Path("logs/rsl_rl") / experiment / datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
     run_dir.mkdir(parents=True, exist_ok=False)
     torch.manual_seed(args.seed)
     source_path = args.resume or args.checkpoint
@@ -124,7 +149,7 @@ def train(args):
     certified = False
     certification = None
     if args.resume:
-        metadata = resume_metadata(source, prepare.CURRICULUM_PROFILE)
+        metadata = resume_metadata(source, profile)
         state.load_state_dict(metadata["curriculum_state"])
         total = int(metadata.get("completed_iterations", source["iter"]))
         history = metadata.get("best_by_stage", {})
@@ -135,17 +160,17 @@ def train(args):
             state.complete = False  # A final validation pass interrupted before the independent test is not certified.
         initial = source_path
     else:
-        converted = prepare.prepare_curriculum_checkpoint(source)
+        converted = prepare_weights(source)
         initial = run_dir / "initial.pt"
         torch.save(converted, initial)
-    cfg = MicroDuckVolleyCurriculumEnvCfg()
+    cfg = EnvCfg()
     cfg.scene.num_envs = args.num_envs
     cfg.sim.device = args.device
     cfg.curriculum_stage = state.stage
     cfg.seed = args.seed
     if args.viz == "none":
         cfg.sim.visualizer_cfgs = []
-    agent = MicroDuckVolleyCurriculumPPORunnerCfg()
+    agent = AgentCfg()
     agent.device = args.device
     agent.seed = args.seed
     (run_dir / "launch.json").write_text(json.dumps(vars(args), default=str, indent=2) + "\n")
@@ -162,13 +187,14 @@ def train(args):
             nonlocal last_safe
             payload = {
                 "microduck_curriculum": {
-                    "profile": prepare.CURRICULUM_PROFILE,
+                    "profile": profile,
                     "curriculum_state": state.state_dict(),
                     "completed_iterations": self.current_learning_iteration + int(learning),
                     "best_by_stage": best,
                     "test_trials": test_trials,
                     "certified": certified,
                     "certification": certification if certified else None,
+                    "vision_contract": env.vision_contract() if args.vision else None,
                 }
             }
             temporary = f"{path}.tmp"
@@ -196,9 +222,11 @@ def train(args):
         },
     ):
         sim_utils.create_new_stage()
-        env = MicroDuckVolleyCurriculumEnv(cfg)
+        env = Environment(cfg)
         runner = None
         try:
+            if args.resume and args.vision and metadata.get("vision_contract") != env.vision_contract():
+                raise ValueError("Saved visual observation/camera contract differs from this environment.")
             wrapped = RslRlVecEnvWrapper(env, clip_actions=agent.clip_actions)
             runner = CurriculumRunner(wrapped, to_dict(agent), log_dir=str(run_dir), device=args.device)
             runner.add_git_repo_to_log(__file__)
@@ -233,6 +261,8 @@ def train(args):
                         break
                 else:
                     raise RuntimeError("GPU preflight did not observe both episode outcomes and ankle support.")
+            if args.vision and any(count == 0 for count in env.vision_diagnostics()["camera_frames_seen"]):
+                raise RuntimeError("Visual preflight did not observe fresh RGB frames from both head cameras.")
             (run_dir / "preflight.json").write_text(
                 json.dumps(
                     {
@@ -241,6 +271,7 @@ def train(args):
                         "steps": preflight_step + 1,
                         "runtime_passed": True,
                         "skill_assessed": False,
+                        "vision": env.vision_diagnostics() if args.vision else None,
                     },
                     indent=2,
                 )
@@ -274,6 +305,7 @@ def train(args):
                         episodes_per_side=args.eval_episodes_per_side,
                     )
                 key = str(state.stage)
+                metrics.update(_vision_metrics(env, args.vision))
                 score = progress_score(metrics)
                 improved = score is not None and score > best.get(key, {}).get("score", -float("inf")) + 1e-6
                 if improved:
@@ -377,7 +409,8 @@ def main():
     )
     source.add_argument("--resume", type=Path, help="latest.pt from this driver; restores curriculum and optimizer.")
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--num-envs", type=int, default=1024)
+    parser.add_argument("--num-envs", type=int, help="Defaults to 32 with --vision, otherwise 1024.")
+    parser.add_argument("--vision", action="store_true", help="Use real head RGB tracking for the actor's ball inputs.")
     parser.add_argument("--iterations", type=int, default=20000)
     parser.add_argument("--eval-interval", type=int, default=500)
     parser.add_argument("--eval-episodes-per-side", type=int, default=64)
@@ -386,6 +419,8 @@ def main():
     parser.add_argument("--viz", choices=("none", "viser"), default="none")
     parser.add_argument("--visible-envs", type=int, default=4)
     args = parser.parse_args()
+    if args.num_envs is None:
+        args.num_envs = 32 if args.vision else 1024
     path = args.resume or args.checkpoint
     if not path.is_file() or args.num_envs < 2 or min(args.iterations, args.eval_interval) < 1:
         parser.error("Supply an existing source checkpoint, >=2 worlds, and positive iteration counts.")

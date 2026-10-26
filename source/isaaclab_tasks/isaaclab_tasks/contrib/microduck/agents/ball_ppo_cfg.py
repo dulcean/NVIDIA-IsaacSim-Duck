@@ -62,3 +62,11 @@ class MicroDuckVolleyCurriculumPPORunnerCfg(MicroDuckVolleyPPORunnerCfg):
         learning_rate=0.00005,
         desired_kl=0.003,
     )
+
+
+@configclass
+class MicroDuckVolleyVisionPPORunnerCfg(MicroDuckVolleyCurriculumPPORunnerCfg):
+    """Train an RGB-tracking actor and an independent simulator-state value function."""
+
+    experiment_name = "microduck_volley_vision"
+    obs_groups = {"actor": ["policy"], "critic": ["critic"]}

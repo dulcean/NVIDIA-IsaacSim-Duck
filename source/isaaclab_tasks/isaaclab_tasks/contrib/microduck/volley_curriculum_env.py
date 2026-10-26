@@ -59,6 +59,21 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
         self._grounded_stable = torch.zeros(self.num_envs, 2, dtype=torch.bool, device=self.device)
         self._potential = torch.zeros(self.num_envs, device=self.device)
         self._episode_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._unsafe_reasons = {
+            name: torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            for name in ("nonfinite", "tilt", "center", "excursion", "collapse", "robot_collision")
+        }
+        self._miss_reasons = {
+            name: torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            for name in (
+                "invalid_head_surface",
+                "invalid_body_contact",
+                "invalid_turn",
+                "game_invalid",
+                "ball_ground",
+                "ball_outside",
+            )
+        }
         self._feet = []
         for sensor in self._sensors:
             ids, _ = sensor.find_sensors("ankle_(left|right)")
@@ -204,23 +219,39 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
             )
             crossed = root[:, 0] > -0.03 if player == 0 else root[:, 0] < 0.03
             excursion = (data.root_link_pos_w.torch[:, :2] - self._home_roots[:, player, :2]).norm(dim=-1)
-            self._unsafe |= (
-                ~finite
-                | (data.projected_gravity_b.torch[:, 2] > -0.5)
-                | crossed
-                | (excursion > self.cfg.maximum_home_excursion)
-                | (self._low_time[:, player] >= self.cfg.collapse_duration)
-            )
+            reasons = {
+                "nonfinite": ~finite,
+                "tilt": data.projected_gravity_b.torch[:, 2] > -0.5,
+                "center": crossed,
+                "excursion": excursion > self.cfg.maximum_home_excursion,
+                "collapse": self._low_time[:, player] >= self.cfg.collapse_duration,
+            }
+            for reason, occurred in reasons.items():
+                self._unsafe_reasons[reason] |= occurred
+                self._unsafe |= occurred
         ball = self._ball.data.root_link_pos_w.torch - self.scene.env_origins
-        self._unsafe |= self._robot_collision | ~torch.isfinite(ball).all(-1)
-        self._unsafe |= ~torch.isfinite(self._ball.data.root_link_vel_w.torch).all(-1)
+        ball_nonfinite = ~torch.isfinite(ball).all(-1) | ~torch.isfinite(self._ball.data.root_link_vel_w.torch).all(-1)
+        self._unsafe_reasons["nonfinite"] |= ball_nonfinite
+        self._unsafe_reasons["robot_collision"] |= self._robot_collision
+        self._unsafe |= self._robot_collision | ball_nonfinite
+        playing = self._episode.phase == 0
+        reasons = {
+            "invalid_head_surface": self._bad_surface,
+            "invalid_body_contact": self._bad_body,
+            "invalid_turn": self._bad_turn,
+            "game_invalid": self._game_invalid,
+            "ball_ground": ball[:, 2] <= self.cfg.ball_radius + 0.001,
+            "ball_outside": (ball[:, 0].abs() > 1.1) | (ball[:, 1].abs() > 0.45),
+        }
+        for reason, occurred in reasons.items():
+            self._miss_reasons[reason] |= occurred & playing
         miss = (
             (ball[:, 2] <= self.cfg.ball_radius + 0.001)
             | (ball[:, 0].abs() > 1.1)
             | (ball[:, 1].abs() > 0.45)
             | self._invalid
             | self._game_invalid
-        ) & (self._episode.phase == 0)
+        ) & playing
         spec = STAGES[self.stage]
         required = self.cfg.play_returns if self.cfg.play_returns > 0 and not self.evaluation else spec.required_returns
         goal = self._qualified_returns >= required if spec.paired else self._virtual_goal
@@ -303,37 +334,71 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
         if hasattr(self, "_terminal_pending"):
             completed = env_ids[self._terminal_pending[env_ids]]
             if len(completed):
-                columns = (
-                    torch.stack(
-                        (
-                            completed,
-                            self._episode_ids[completed],
-                            self._server[completed],
-                            self._episode.success[completed],
-                            self._unsafe[completed],
-                            self._qualified_returns[completed],
-                            self._episode.phase[completed] == 1,
-                            self._launch_total[completed] / self._hits[completed].clamp_min(1),
-                        ),
-                        dim=1,
-                    )
-                    .detach()
-                    .cpu()
-                    .tolist()
+                timed_out = self.episode_length_buf[completed] >= self.max_episode_length - 1
+                recovered_miss = (
+                    (self._episode.phase[completed] == 2)
+                    & (self._episode.phase_time[completed] + 1e-6 >= self.cfg.recovery_duration)
+                    & (self._episode.stable_time[completed] + 1e-6 >= self.cfg.recovery_hold)
+                    & self._grounded_stable[completed].all(-1)
+                    & ~self._unsafe[completed]
+                    & ~timed_out
                 )
-                for index, serial, server, success, unsafe, returns, goal_reached, quality in columns:
+                fields = {
+                    "env_id": completed,
+                    "episode_id": self._episode_ids[completed],
+                    "server": self._server[completed],
+                    "success": self._episode.success[completed],
+                    "unsafe": self._unsafe[completed],
+                    "returns": self._qualified_returns[completed],
+                    "goal_reached": self._episode.phase[completed] == 1,
+                    "launch_quality": self._launch_total[completed] / self._hits[completed].clamp_min(1),
+                    "head_hits": self._hits[completed],
+                    "head_contacts": self._raw_hits[completed],
+                    "recovered_miss": recovered_miss,
+                    "stable_a": self._grounded_stable[completed, 0],
+                    "stable_b": self._grounded_stable[completed, 1],
+                    "recovery_hold_s": torch.where(
+                        self._grounded_stable[completed].all(-1), self._episode.stable_time[completed], 0.0
+                    ),
+                    "timed_out": timed_out,
+                    "missed": self._episode.phase[completed] == 2,
+                }
+                fields.update({f"unsafe_{name}": flags[completed] for name, flags in self._unsafe_reasons.items()})
+                fields.update({f"miss_{name}": flags[completed] for name, flags in self._miss_reasons.items()})
+                columns = torch.stack(tuple(fields.values()), dim=1).detach().cpu().tolist()
+                for values in columns:
+                    row = dict(zip(fields, values))
+                    if row["unsafe"]:
+                        reason = "unsafe"
+                    elif row["success"]:
+                        reason = "success"
+                    elif row["goal_reached"]:
+                        reason = "target_unrecovered"
+                    elif row["missed"]:
+                        reason = "missed"
+                    elif row["timed_out"]:
+                        reason = "timeout"
+                    else:
+                        reason = "missed"
                     records.append(
                         {
-                            "env_id": int(index),
-                            "episode_id": int(serial),
-                            "server": int(server),
-                            "success": bool(success),
-                            "unsafe": bool(unsafe),
-                            "returns": int(returns),
-                            "goal_reached": bool(goal_reached),
-                            "launch_quality": quality,
+                            "env_id": int(row["env_id"]),
+                            "episode_id": int(row["episode_id"]),
+                            "server": int(row["server"]),
+                            "success": bool(row["success"]),
+                            "unsafe": bool(row["unsafe"]),
+                            "returns": int(row["returns"]),
+                            "goal_reached": bool(row["goal_reached"]),
+                            "launch_quality": row["launch_quality"],
+                            "head_hits": int(row["head_hits"]),
+                            "head_contacts": int(row["head_contacts"]),
+                            "recovered_miss": bool(row["recovered_miss"]),
+                            "recovery_stable_by_player": [bool(row["stable_a"]), bool(row["stable_b"])],
+                            "recovery_hold_s": row["recovery_hold_s"],
+                            "unsafe_reasons": [name for name in self._unsafe_reasons if row[f"unsafe_{name}"]],
+                            "miss_reasons": [name for name in self._miss_reasons if row[f"miss_{name}"]],
                             "stage": self.stage,
-                            "reason": "unsafe" if unsafe else ("success" if success else "miss_or_unrecovered"),
+                            "reason": reason,
                         }
                     )
         self.cfg.separation = self.cfg.stage_separations[self.stage]
@@ -344,8 +409,24 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
                 "Metrics/success": sum(r["success"] for r in records) / len(records),
                 "Metrics/unsafe": sum(r["unsafe"] for r in records) / len(records),
                 "Metrics/returns": sum(r["returns"] for r in records) / len(records),
+                "Metrics/head_hits": sum(r["head_hits"] for r in records) / len(records),
+                "Metrics/head_contacts": sum(r["head_contacts"] for r in records) / len(records),
+                "Metrics/goal_reached": sum(r["goal_reached"] for r in records) / len(records),
+                "Metrics/launch_quality": sum(r["launch_quality"] for r in records) / len(records),
+                "Metrics/recovered_miss": sum(r["recovered_miss"] for r in records) / len(records),
+                "Metrics/recovery_stable_a": sum(r["recovery_stable_by_player"][0] for r in records) / len(records),
+                "Metrics/recovery_stable_b": sum(r["recovery_stable_by_player"][1] for r in records) / len(records),
+                "Metrics/recovery_hold_s": sum(r["recovery_hold_s"] for r in records) / len(records),
                 "Metrics/curriculum_stage": float(self.stage),
             }
+            for reason in self._unsafe_reasons:
+                self.extras["log"][f"Metrics/unsafe_{reason}"] = sum(
+                    reason in r["unsafe_reasons"] for r in records
+                ) / len(records)
+            for reason in self._miss_reasons:
+                self.extras["log"][f"Metrics/{reason}"] = sum(reason in r["miss_reasons"] for r in records) / len(
+                    records
+                )
         self._episode.reset(env_ids)
         for buffer in (
             self._flight_clock,
@@ -364,6 +445,8 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
             self._goal_started,
             self._miss_started,
             self._virtual_goal,
+            *self._unsafe_reasons.values(),
+            *self._miss_reasons.values(),
         ):
             buffer[env_ids] = 0
         self._own_hit_age[env_ids] = 2

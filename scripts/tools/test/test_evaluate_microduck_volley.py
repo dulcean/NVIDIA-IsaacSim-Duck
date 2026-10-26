@@ -75,12 +75,35 @@ class DeterministicPolicy:
 
 def test_fixed_cohort_waits_for_slow_failures_and_ignores_auto_reset_followups():
     """Fast successful worlds cannot replace slow unsafe worlds with extra short episodes."""
+    good = {
+        "goal_reached": True,
+        "head_hits": 1,
+        "head_contacts": 1,
+        "recovered_miss": False,
+        "recovery_stable_by_player": [True, True],
+        "recovery_hold_s": 0.26,
+        "unsafe_reasons": [],
+        "miss_reasons": [],
+    }
+    bad = {
+        "goal_reached": False,
+        "head_hits": 0,
+        "head_contacts": 1,
+        "recovered_miss": False,
+        "recovery_stable_by_player": [True, False],
+        "recovery_hold_s": 0.0,
+        "unsafe_reasons": ["tilt"],
+        "miss_reasons": ["invalid_head_surface"],
+    }
     source = EpisodeSource(
         4,
         {
-            1: [episode(0), episode(2)],
+            1: [{**episode(0), **good}, {**episode(2), **good}],
             2: [episode(0, episode_id=2), episode(2, episode_id=2)],
-            4: [episode(1, success=False, unsafe=True), episode(3, success=False, unsafe=True)],
+            4: [
+                {**episode(1, success=False, unsafe=True), **bad},
+                {**episode(3, success=False, unsafe=True), **bad},
+            ],
         },
     )
     policy = DeterministicPolicy()
@@ -93,6 +116,16 @@ def test_fixed_cohort_waits_for_slow_failures_and_ignores_auto_reset_followups()
     assert metrics["success_rate_by_side"] == [1.0, 0.0]
     assert metrics["complete"] and not metrics["gate_passed"]
     assert metrics["steps"] == 8 and source.resets == 2
+    assert metrics["diagnostic_episodes"] == 6
+    assert metrics["head_hit_rate"] == metrics["mean_head_hits"] == 0.5
+    assert metrics["mean_head_contacts"] == 1.0
+    assert metrics["goal_reached_rate"] == 0.5
+    assert metrics["recovery_stable_rate_by_player"] == [1.0, 0.5]
+    assert metrics["recovery_stable_rate_by_role"] == {"receiver": 0.5, "partner": 1.0}
+    assert metrics["mean_recovery_hold_s"] == pytest.approx(0.13)
+    assert metrics["recovered_miss_rate"] == 0.0
+    assert metrics["unsafe_reasons"] == {"tilt": 3}
+    assert metrics["miss_reasons"] == {"invalid_head_surface": 3}
     assert policy.training and not source.recording
 
 
@@ -109,10 +142,19 @@ def test_step_limit_does_not_count_stale_records_or_certify_a_partial_cohort():
     assert state.update_evaluation(report).status == "insufficient"
 
 
-def test_wrong_stage_outcome_fails_closed_and_restores_policy_mode():
-    """A mislabeled rollout cannot silently certify an easier objective or leave training mode changed."""
-    source = EpisodeSource(2, {1: [episode(0, stage=1)]})
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"stage": 1}, "different stage"),
+        ({"head_hits": True}, "integer counts"),
+        ({"recovery_hold_s": float("nan")}, "finite and non-negative"),
+        ({"recovery_stable_by_player": [True, 1]}, "boolean for each player"),
+    ],
+)
+def test_malformed_outcome_fails_closed_and_restores_policy_mode(overrides, message):
+    """Bad physical metadata cannot certify a lesson or publish misleading diagnostics."""
+    source = EpisodeSource(2, {1: [{**episode(0), **overrides}]})
     policy = DeterministicPolicy()
-    with pytest.raises(ValueError, match="different stage"):
+    with pytest.raises(ValueError, match=message):
         evaluation.evaluate_policy(source, policy, stage=0, evaluation_id=0, episodes_per_side=1)
     assert policy.training and not source.recording
