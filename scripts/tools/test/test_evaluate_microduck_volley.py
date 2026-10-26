@@ -33,11 +33,13 @@ def episode(world, *, success=True, unsafe=False, episode_id=1, stage=0):
 class EpisodeSource:
     """Emit predefined asynchronous episode completions at the collector boundary."""
 
-    def __init__(self, num_envs, schedule):
+    def __init__(self, num_envs, schedule, profile=None):
         self.num_envs = num_envs
         self.schedule = schedule
         self.unwrapped = self
         self.cfg = SimpleNamespace(evaluation=True, curriculum_stage=0)
+        if profile is not None:
+            self.cfg.curriculum_profile = profile
         self.evaluation = True
         self.recording = False
         self.extras = {}
@@ -158,3 +160,103 @@ def test_malformed_outcome_fails_closed_and_restores_policy_mode(overrides, mess
     with pytest.raises(ValueError, match=message):
         evaluation.evaluate_policy(source, policy, stage=0, evaluation_id=0, episodes_per_side=1)
     assert policy.training and not source.recording
+
+
+@pytest.mark.parametrize(
+    ("stage", "objective"),
+    [(0, "watch_visible_ball"), (1, "receive_forehead"), (2, "aim_return")],
+)
+def test_visual_evaluation_identifies_its_actual_objective_despite_equal_zero_return_counts(stage, objective):
+    """Visual acquisition, legal contact, and a measured return cannot exchange graduation evidence."""
+    source = EpisodeSource(
+        2,
+        {1: [{**episode(side, stage=stage), "objective": objective} for side in (0, 1)]},
+        profile=evaluation.VISION_PROFILE,
+    )
+    source.cfg.curriculum_stage = stage
+    report, metrics = evaluation.evaluate_policy(
+        source, DeterministicPolicy(), stage=stage, evaluation_id=0, episodes_per_side=1
+    )
+    contract = evaluation._curriculum_module(evaluation.VISION_PROFILE)
+    assert isinstance(report, contract.VisionEvaluationReport)
+    assert report.objective == metrics["objective"] == objective
+    assert metrics["profile"] == evaluation.VISION_PROFILE and report.complete
+    state = contract.VisionCurriculumState(stage=stage, min_attempts_per_side=1)
+    assert state.update_evaluation(report).status == "passed"
+
+
+@pytest.mark.parametrize("objective", [None, "aim_return"])
+def test_watch_evaluation_rejects_teacher_or_other_visual_objective_records(objective):
+    """A teacher success or a different zero-return visual lesson cannot masquerade as RGB acquisition."""
+    record = episode(0)
+    if objective is not None:
+        record["objective"] = objective
+    source = EpisodeSource(2, {1: [record]}, profile=evaluation.VISION_PROFILE)
+    with pytest.raises(ValueError, match="objective"):
+        evaluation.evaluate_policy(source, DeterministicPolicy(), stage=0, evaluation_id=0, episodes_per_side=1)
+
+
+def test_partial_visual_acquisition_improves_checkpoint_selection_without_graduating():
+    """Growing real exposure windows stay observable before the complete watch-and-recover objective succeeds."""
+    from scripts.tools import train_microduck_volley as driver
+
+    records = [
+        {
+            **episode(side, success=False),
+            "objective": "watch_visible_ball",
+            "goal_reached": False,
+            "gaze_visible_a": 0.6 if side == 0 else 0.8,
+            "gaze_visible_b": 0.9 if side == 0 else 0.4,
+            "gaze_alignment": 0.7,
+            "gaze_reward": 0.02,
+            "watch_visible_s": 0.12 if side == 0 else 0.09,
+        }
+        for side in (0, 1)
+    ]
+    source = EpisodeSource(2, {1: records}, profile=evaluation.VISION_PROFILE)
+    source.cfg.watch_duration = 0.30
+    contract = evaluation._curriculum_module(evaluation.VISION_PROFILE)
+    state = contract.VisionCurriculumState()
+    report, metrics = evaluation.evaluate_policy(
+        source, DeterministicPolicy(), stage=0, evaluation_id=0, episodes_per_side=64
+    )
+    assert metrics["watch_fraction_by_server"] == pytest.approx([0.4, 0.3])
+    assert metrics["gaze_visible_by_role"] == pytest.approx({"receiver": 0.5, "partner": 0.85})
+    partial_score = driver.progress_score(metrics)
+    assert 0 < partial_score <= 0.01
+    assert not metrics["gate_passed"] and state.update_evaluation(report).status == "hold"
+    records[0]["watch_visible_s"], records[1]["watch_visible_s"] = 0.18, 0.165
+    report, improved = evaluation.evaluate_policy(
+        source, DeterministicPolicy(), stage=0, evaluation_id=1, episodes_per_side=64
+    )
+    assert driver.progress_score(improved) > partial_score
+    assert not improved["gate_passed"] and state.update_evaluation(report).status == "hold"
+    assert state.stage == 0 and state.consecutive_passes == 0
+
+
+@pytest.mark.parametrize("visibility", [None, 0.59, float("nan")])
+def test_final_visual_success_cannot_certify_a_blind_or_unmeasured_rally(visibility):
+    """Eight physical returns alone cannot certify a final episode that lacks both players' RGB evidence."""
+    record = {**episode(0, stage=5), "returns": 8, "objective": "rally", "gaze_visible_b": 0.9}
+    if visibility is not None:
+        record["gaze_visible_a"] = visibility
+    source = EpisodeSource(2, {1: [record]}, profile=evaluation.VISION_PROFILE)
+    source.cfg.curriculum_stage = 5
+    source.cfg.final_min_gaze_visibility = 0.60
+    with pytest.raises(ValueError, match="visibility|finite"):
+        evaluation.evaluate_policy(source, DeterministicPolicy(), stage=5, evaluation_id=0, episodes_per_side=1)
+
+
+def test_final_visual_episode_uses_the_declared_visibility_threshold_for_each_player():
+    records = [
+        {**episode(side, stage=5), "returns": 8, "objective": "rally", "gaze_visible_a": 0.6, "gaze_visible_b": 0.75}
+        for side in (0, 1)
+    ]
+    source = EpisodeSource(2, {1: records}, profile=evaluation.VISION_PROFILE)
+    source.cfg.curriculum_stage = 5
+    source.cfg.final_min_gaze_visibility = 0.60
+    report, metrics = evaluation.evaluate_policy(
+        source, DeterministicPolicy(), stage=5, evaluation_id=0, episodes_per_side=1
+    )
+    assert report.successes_by_side == (1, 1) and report.objective == "rally"
+    assert metrics["final_min_gaze_visibility"] == 0.60

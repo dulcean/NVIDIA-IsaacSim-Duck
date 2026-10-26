@@ -52,9 +52,12 @@ def preview(args) -> dict:
     converter = _tool("prepare_microduck_vision_checkpoint")
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     metadata = (checkpoint.get("infos") or {}).get("microduck_curriculum", {})
+    source_profile = metadata.get("profile", "legacy_state_actor")
     converted = metadata.get("profile") != converter.VISION_PROFILE
     if converted:
         checkpoint = converter.prepare_vision_checkpoint(checkpoint)
+    vision_contract = _tool("evaluate_microduck_volley")._curriculum_module(converter.VISION_PROFILE)
+    lesson = vision_contract.VISION_STAGES[args.stage]
     actor = checkpoint.get("actor_state_dict")
     if not isinstance(actor, dict) or any(
         not isinstance(value, torch.Tensor) or not torch.isfinite(value).all() for value in actor.values()
@@ -79,20 +82,28 @@ def preview(args) -> dict:
     report = {
         "checkpoint": str(args.checkpoint.resolve()),
         "checkpoint_profile": checkpoint["infos"]["microduck_curriculum"]["profile"],
+        "source_checkpoint_profile": source_profile,
         "converted_legacy_actor": converted,
+        "migration_scope": "Warm-start adaptation only; new visual curriculum performance is unassessed."
+        if converted
+        else "No checkpoint conversion.",
         "stage": args.stage,
+        "stage_name": lesson.name,
+        "objective": lesson.objective,
         "num_envs": args.num_envs,
         "seed": args.seed,
         "real_time": args.real_time and args.viz == "viser",
         "head_panels_enabled": cfg.head_camera_panels,
         "head_panel_fps": args.panel_fps,
         "status": "initializing",
-        "actor_observation_width": 146,
+        "actor_observation_width": converter.ACTOR_WIDTH,
         "critic_observation_width": 142,
         "display_rotation": "90 degrees clockwise; original camera pixels feed the tracker",
         "runtime_passed": False,
         "skill_assessed": False,
-        "ground_truth_use": "diagnostic errors only; actor ball state comes from RGB",
+        "ground_truth_use": (
+            "Critic, task/reward labels and diagnostics; actor ball state and search memory come only from RGB."
+        ),
     }
     phases = {name: 0.0 for name in ("policy", "environment_step", "diagnostics", "artifacts", "pacing_wait")}
     completed_steps = 0

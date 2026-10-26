@@ -8,6 +8,7 @@
 import copy
 import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -68,6 +69,24 @@ def test_progress_selection_uses_physical_outcomes_and_the_weaker_receiving_side
     assert driver.progress_score({**baseline, "success_rate_by_side": [1.0, 0.4]}) < score
     assert driver.progress_score({**baseline, "unsafe_rate": 0.5}) < score
     assert driver.progress_score({**baseline, "complete": False}) is None
+    assert driver.progress_score({**baseline, "watch_fraction_by_server": [1.0, 1.0]}) == score
+
+
+def test_watch_selection_bins_partial_progress_without_overriding_one_real_success():
+    """A tiny watch tie-break tolerates sub-bin noise and stays below one balanced 64-episode success increment."""
+    baseline = {
+        "complete": True,
+        "success_rate_by_side": [0.0, 0.0],
+        "goal_reached_rate": 0.0,
+        "unsafe_rate": 0.0,
+        "objective": "watch_visible_ball",
+        "watch_fraction_by_server": [0.551, 0.7],
+    }
+    score = driver.progress_score(baseline)
+    assert driver.progress_score({**baseline, "watch_fraction_by_server": [0.559, 0.7]}) == score
+    assert driver.progress_score({**baseline, "watch_fraction_by_server": [1.0, 1.0]}) < driver.progress_score(
+        {**baseline, "watch_fraction_by_server": [0.0, 0.0], "success_rate_by_side": [1 / 64, 1 / 64]}
+    )
 
 
 def test_full_resume_accepts_complete_state_without_mutating_it(resumable_checkpoint):
@@ -137,3 +156,51 @@ def test_neighbor_tool_loading_works_from_an_unrelated_working_directory(tmp_pat
         timeout=30,
     )
     assert result.stdout.strip() == "microduck_volley_curriculum_v1"
+
+
+def test_visual_full_resume_uses_visual_objectives_and_rejects_teacher_progress(resumable_checkpoint):
+    """A v2 tag needs v2 lesson evidence; a teacher stage number alone cannot resume the visual task."""
+    evaluator = driver._tool("evaluate_microduck_volley")
+    contract = evaluator._curriculum_module(evaluator.VISION_PROFILE)
+    prepare = driver._tool("prepare_microduck_vision_checkpoint")
+    checkpoint = prepare.prepare_vision_checkpoint(resumable_checkpoint)
+    # The genuine empty Adam state remains valid: conversion changes tensor widths, not parameter count.
+    checkpoint["optimizer_state_dict"] = resumable_checkpoint["optimizer_state_dict"]
+    checkpoint["iter"] = 8
+    state = contract.VisionCurriculumState(stage=1)
+    metadata = checkpoint["infos"]["microduck_curriculum"]
+    metadata.update(curriculum_state=state.state_dict(), completed_iterations=8, certified=False)
+    assert driver.resume_metadata(checkpoint, evaluator.VISION_PROFILE) is metadata
+    metadata["curriculum_state"] = resumable_checkpoint["infos"]["microduck_curriculum"]["curriculum_state"]
+    with pytest.raises(ValueError, match="incompatible curriculum"):
+        driver.resume_metadata(checkpoint, evaluator.VISION_PROFILE)
+
+
+def test_visual_certification_cannot_reuse_another_lessons_passing_test(resumable_checkpoint):
+    """A final visual checkpoint must identify the actual final rally objective in its independent evidence."""
+    evaluator = driver._tool("evaluate_microduck_volley")
+    contract = evaluator._curriculum_module(evaluator.VISION_PROFILE)
+    checkpoint = driver._tool("prepare_microduck_vision_checkpoint").prepare_vision_checkpoint(resumable_checkpoint)
+    checkpoint["optimizer_state_dict"] = resumable_checkpoint["optimizer_state_dict"]
+    checkpoint["iter"] = 8
+    state = contract.VisionCurriculumState(stage=5)
+    state.complete = True
+    report = contract.VisionEvaluationReport(1000001, 5, 8, (64, 64), (60, 60), 0, objective="rally")
+    metadata = checkpoint["infos"]["microduck_curriculum"]
+    metadata.update(
+        curriculum_state=state.state_dict(),
+        completed_iterations=8,
+        certified=True,
+        certification={**asdict(report), "gate_passed": True},
+    )
+    assert driver.resume_metadata(checkpoint, evaluator.VISION_PROFILE) is metadata
+    metadata["certification"]["objective"] = "watch_visible_ball"
+    with pytest.raises(ValueError, match="certified checkpoint"):
+        driver.resume_metadata(checkpoint, evaluator.VISION_PROFILE)
+
+
+def test_legacy_visual_resume_requires_explicit_warm_start(resumable_checkpoint):
+    """Old visual stage evidence and optimizer cannot continue under the new acquisition-first objectives."""
+    resumable_checkpoint["infos"]["microduck_curriculum"]["profile"] = "microduck_volley_vision_v1"
+    with pytest.raises(ValueError, match="fresh v2 warm start"):
+        driver.resume_metadata(resumable_checkpoint, "microduck_volley_vision_v2")

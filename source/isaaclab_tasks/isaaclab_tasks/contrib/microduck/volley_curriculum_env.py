@@ -26,11 +26,12 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
     """
 
     cfg: MicroDuckVolleyCurriculumEnvCfg
+    stages = STAGES
 
     def __init__(self, cfg, **kwargs):
         super().__init__(cfg, **kwargs)
         self.stage = cfg.curriculum_stage
-        if not 0 <= self.stage < len(STAGES):
+        if not 0 <= self.stage < len(self.stages):
             raise ValueError("Unknown volleyball curriculum stage.")
         self.evaluation = cfg.evaluation
         self._train_generator = torch.Generator(device=self.device).manual_seed(cfg.seed or 0)
@@ -83,7 +84,7 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
 
     def set_stage(self, stage):
         """Select the next lesson; the caller resets worlds before stepping it."""
-        if not 0 <= stage < len(STAGES):
+        if not 0 <= stage < len(self.stages):
             raise ValueError("Unknown volleyball curriculum stage.")
         self.stage = self.cfg.curriculum_stage = stage
 
@@ -129,7 +130,7 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
         old_hitter = self._last_hitter.clone()
         super()._update_contacts()
         new_hits = self._player_hit_event > previous
-        spec = STAGES[self.stage]
+        spec = self.stages[self.stage]
         for player in range(2):
             hit = new_hits[:, player] & active
             reply = hit & (old_hitter >= 0)
@@ -252,9 +253,7 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
             | self._invalid
             | self._game_invalid
         ) & playing
-        spec = STAGES[self.stage]
-        required = self.cfg.play_returns if self.cfg.play_returns > 0 and not self.evaluation else spec.required_returns
-        goal = self._qualified_returns >= required if spec.paired else self._virtual_goal
+        goal = self._stage_goal()
         timeout = self.episode_length_buf >= self.max_episode_length - 1
         done, _, self._goal_started, self._miss_started = self._episode.step(
             goal,
@@ -273,6 +272,20 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
         self._release_event *= legal.float()
         self._hits += self._hit_event
         return done, timeout
+
+    def _stage_goal(self):
+        spec = self.stages[self.stage]
+        required = self.cfg.play_returns if self.cfg.play_returns > 0 and not self.evaluation else spec.required_returns
+        return self._qualified_returns >= required if spec.paired else self._virtual_goal
+
+    def _serve_height_range(self):
+        return (0.18, 0.25)
+
+    def _serve_source_offset(self, receiving, partner):
+        return None
+
+    def _episode_record_fields(self, env_ids):
+        return {}
 
     def _get_rewards(self):
         stable, potential = self._balance()
@@ -301,7 +314,7 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
             data = robot.data
             quat = data.root_link_quat_w.torch
             phase = self._episode.phase.float()
-            if not STAGES[self.stage].paired:
+            if not self.stages[self.stage].paired:
                 phase = torch.where((phase == 0) & (self._last_hitter >= 0), 0.5, phase)
             extras = torch.cat(
                 (
@@ -316,15 +329,15 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
                     self._own_hit_age[:, player : player + 1].clamp_max(2) / 2,
                     (self._episode.phase_time / self.cfg.recovery_duration).clamp_max(1).unsqueeze(-1),
                     (self._episode.stable_time / self.cfg.recovery_hold).clamp_max(1).unsqueeze(-1),
-                    torch.full((self.num_envs, 1), float(not STAGES[self.stage].paired), device=self.device),
+                    torch.full((self.num_envs, 1), float(not self.stages[self.stage].paired), device=self.device),
                     phase.unsqueeze(-1) / 2,
-                    torch.full((self.num_envs, 1), self.stage / (len(STAGES) - 1), device=self.device),
+                    torch.full((self.num_envs, 1), self.stage / (len(self.stages) - 1), device=self.device),
                 ),
                 dim=-1,
             )
             blocks[:, player, 48:61] = extras
             waiting = self._episode.phase > 0
-            if not STAGES[self.stage].paired:
+            if not self.stages[self.stage].paired:
                 waiting |= self._last_hitter >= 0
             blocks[:, player, 70] = torch.where(waiting, -1.0, (self._expected() == player).float())
         return {"policy": blocks.flatten(1)}
@@ -365,6 +378,8 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
                 }
                 fields.update({f"unsafe_{name}": flags[completed] for name, flags in self._unsafe_reasons.items()})
                 fields.update({f"miss_{name}": flags[completed] for name, flags in self._miss_reasons.items()})
+                additional = self._episode_record_fields(completed)
+                fields.update(additional)
                 columns = torch.stack(tuple(fields.values()), dim=1).detach().cpu().tolist()
                 for values in columns:
                     row = dict(zip(fields, values))
@@ -399,6 +414,12 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
                             "miss_reasons": [name for name in self._miss_reasons if row[f"miss_{name}"]],
                             "stage": self.stage,
                             "reason": reason,
+                            **{name: row[name] for name in additional},
+                            **(
+                                {"objective": self.stages[self.stage].objective}
+                                if hasattr(self.stages[self.stage], "objective")
+                                else {}
+                            ),
                         }
                     )
         self.cfg.separation = self.cfg.stage_separations[self.stage]
@@ -453,7 +474,7 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
         self._episode_ids[env_ids] += 1
         count = len(env_ids)
         self._server[env_ids] = env_ids.long() % 2 if self.evaluation else (self._uniform(count, 0, 1) >= 0.5).long()
-        spec = STAGES[self.stage]
+        spec = self.stages[self.stage]
         if not spec.paired:
             for player, robot in enumerate(self._robots):
                 pose = robot.data.root_link_pose_w.torch[env_ids].clone()
@@ -485,9 +506,10 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
             receiving - self.scene.env_origins[env_ids],
             partner - self.scene.env_origins[env_ids],
             self._uniform(count, *spec.flight_time_range),
-            self._uniform(count, 0.18, 0.25),
+            self._uniform(count, *self._serve_height_range()),
             self._uniform(count, *spec.lateral_range),
             offset,
+            source_offset=self._serve_source_offset(receiving, partner),
         )
         if not valid.all():
             raise RuntimeError("Curriculum produced an invalid serve: refusing a nonphysical training batch.")

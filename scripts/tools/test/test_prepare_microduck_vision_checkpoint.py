@@ -13,7 +13,13 @@ from rsl_rl.models import MLPModel
 from tensordict import TensorDict
 
 from scripts.tools.prepare_microduck_curriculum_checkpoint import CURRICULUM_PROFILE
-from scripts.tools.prepare_microduck_vision_checkpoint import VISION_PROFILE, prepare_vision_checkpoint
+from scripts.tools.prepare_microduck_vision_checkpoint import (
+    LAST_SEEN_BEARING_COLUMNS,
+    LEGACY_VISION_PROFILE,
+    VISION_PROFILE,
+    VISION_STATE_COLUMNS,
+    prepare_vision_checkpoint,
+)
 
 
 def _model(width: int, players: int = 2, critic: bool = False) -> MLPModel:
@@ -33,10 +39,11 @@ def _model(width: int, players: int = 2, critic: bool = False) -> MLPModel:
 
 
 @pytest.mark.parametrize(
-    "width,players,profile", [(61, 1, None), (71, 1, None), (142, 2, None), (142, 2, CURRICULUM_PROFILE)]
+    "width,players,profile",
+    [(61, 1, None), (71, 1, None), (142, 2, None), (142, 2, CURRICULUM_PROFILE), (146, 2, LEGACY_VISION_PROFILE)],
 )
 def test_vision_transfer_preserves_actions_and_keeps_state_inputs_trainable(width, players, profile):
-    """Reindexing must preserve nonzero normalization, dense cross-weights and trained curriculum state."""
+    """Reindexing preserves dense cross-weights and old features despite arbitrary new visual history."""
     torch.manual_seed(23)
     source = _model(width, players).eval()
     with torch.no_grad():
@@ -49,12 +56,13 @@ def test_vision_transfer_preserves_actions_and_keeps_state_inputs_trainable(widt
     if profile:
         checkpoint["infos"] = {"microduck_curriculum": {"profile": profile, "curriculum_state": {"stage": 2}}}
     prepared = prepare_vision_checkpoint(checkpoint, initial_std=0.09)
-    target = _model(146).eval()
+    target = _model(152).eval()
     target.load_state_dict(prepared["actor_state_dict"], strict=True)
     critic = _model(142, critic=True)
     critic.load_state_dict(prepared["critic_state_dict"], strict=True)
 
-    legacy = torch.randn(4, 2, 71)
+    source_block_width = 73 if profile == LEGACY_VISION_PROFILE else 71
+    legacy = torch.randn(4, 2, source_block_width)
     if profile is None:
         legacy[:, :, 48:61] = 0
     if players == 1:
@@ -63,7 +71,7 @@ def test_vision_transfer_preserves_actions_and_keeps_state_inputs_trainable(widt
         )
     else:
         expected = source(TensorDict({"policy": legacy.flatten(1)}, batch_size=[4]))
-    visual = torch.cat((legacy, torch.randn(4, 2, 2) * 5), -1)
+    visual = torch.cat((legacy, torch.randn(4, 2, 76 - source_block_width) * 5), -1)
     actual = target(TensorDict({"policy": visual.flatten(1)}, batch_size=[4]))
     torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
     for name, value in source.state_dict().items():
@@ -75,18 +83,24 @@ def test_vision_transfer_preserves_actions_and_keeps_state_inputs_trainable(widt
     assert metadata["source_curriculum_stage"] == (2 if profile else None)
     assert critic.obs_normalizer.count.item() == 0
     assert target.obs_normalizer.count.item() == 1_838_856_192
-    assert torch.isfinite(critic(TensorDict({"critic": legacy.flatten(1)}, batch_size=[4]))).all()
+    privileged = legacy[:, :, :71].reshape(4, 142)
+    assert torch.isfinite(critic(TensorDict({"critic": privileged}, batch_size=[4]))).all()
     torch.testing.assert_close(target.distribution.std_param, torch.full((28,), 0.09))
 
     actual.square().sum().backward()
-    assert target.mlp[0].weight.grad[:, [71, 72, 144, 145]].abs().sum() > 0
+    new_columns = LAST_SEEN_BEARING_COLUMNS if profile == LEGACY_VISION_PROFILE else VISION_STATE_COLUMNS
+    assert target.mlp[0].weight.grad[:, new_columns].abs().sum() > 0
     assert all(parameter.requires_grad for parameter in target.parameters())
     if profile:
         torch.testing.assert_close(target.mlp[0].weight[:, 48:61], source.mlp[0].weight[:, 48:61])
-        torch.testing.assert_close(target.mlp[0].weight[:, 121:134], source.mlp[0].weight[:, 119:132])
+        torch.testing.assert_close(
+            target.mlp[0].weight[:, 124:137], source.mlp[0].weight[:, source_block_width + 48 : source_block_width + 61]
+        )
 
 
-@pytest.mark.parametrize("damage", ["duplicate_conversion", "nonfinite_actor", "malformed_actor", "unknown_profile"])
+@pytest.mark.parametrize(
+    "damage", ["duplicate_conversion", "nonfinite_actor", "malformed_actor", "unknown_profile", "corrupt_vision_v1"]
+)
 def test_vision_transfer_rejects_incompatible_or_corrupt_sources(damage):
     """Invalid shape/profile or NaN state must fail before a long visual training job starts."""
     source = {"actor_state_dict": _model(142).state_dict()}
@@ -99,6 +113,11 @@ def test_vision_transfer_rejects_incompatible_or_corrupt_sources(damage):
     elif damage == "malformed_actor":
         source["actor_state_dict"]["mlp.0.weight"] = source["actor_state_dict"]["mlp.0.weight"][:, :-1]
         message = "Expected a MicroDuck actor"
+    elif damage == "corrupt_vision_v1":
+        source["actor_state_dict"] = _model(146).state_dict()
+        source["actor_state_dict"]["mlp.0.weight"][0, 145] = float("nan")
+        source["infos"] = {"microduck_curriculum": {"profile": LEGACY_VISION_PROFILE}}
+        message = "Invalid actor tensor"
     else:
         source["infos"] = {"microduck_curriculum": {"profile": "unknown_visual_task_v2"}}
         message = "Unsupported source checkpoint profile"

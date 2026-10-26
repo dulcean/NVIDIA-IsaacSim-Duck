@@ -51,20 +51,23 @@ sets their presentation ceiling; it does not change sensor or policy timing.
 
 `logs/microduck_vision_preview/` receives the first/last valid RGB snapshots and
 `preview.json`: fresh-frame counts, accepted pixel measurements, track ages and measured
-position errors against simulation truth. Truth is diagnostic only. Zero error samples
+position errors against simulation truth. Truth labels also define training rewards and
+task qualification; they never initialize the tracker or replace actor ball features. Zero error samples
 means no accuracy measurement, even if the error sum is zero. A ball above the forehead
 may be outside a forward-facing camera; zero detections alone do not prove sensor failure.
 Check the images and the physical camera direction. Preview checks runtime execution,
 not successful volleyball. It does not change weights or run optimizer updates.
 
-The preview accepts legacy standing/heading/paired weights and curriculum weights,
-adapting a copy in memory. A vision checkpoint loads directly and validates its saved
-camera contract. Checkpoints from earlier tasks do not already contain a learned visual policy.
+The preview accepts legacy standing/heading/paired weights, teacher curriculum weights,
+and vision-v1 weights, adapting a copy in memory to `microduck_volley_vision_v2`.
+Source checkpoint files remain unchanged. A current v2 checkpoint loads directly and
+validates its saved camera contract. Migration preserves weights, not proof that the new
+visual curriculum has been learned.
 
 For the physical sensor integration check on that host:
 
 ```bash
-uv run python -m pytest source/isaaclab_tasks/test/test_microduck_vision.py -q
+uv run --extra test python -m pytest source/isaaclab_tasks/test/test_microduck_vision.py -q
 ```
 
 This uses one two-world Newton scene, actual distorted RGB, actual airborne spheres,
@@ -89,48 +92,119 @@ ballistic prediction lasts at most 0.15 s; expiry returns zero ball features and
 age flag. Partial resets clear only the selected tracks and discard captures from the
 intermediate reset scene. No tracker is initialized from the reset ball coordinates.
 
-The actor has 146 inputs: two 73-value blocks. Each block preserves 71 task/proprioceptive
-channels, replaces the six ball position/velocity channels with visual estimates, then
-appends fresh-measurement visibility and normalized track age. All true ball position and
-velocity channels are replaced, including when the camera sees nothing. The separate
-142-input critic may use ball truth. Referee turn/phase, root kinematics and joint/IMU
-state remain available; this does not model a full hardware odometry/localization stack.
-Exposure, motion blur and camera/estimator latency have not been calibrated to hardware.
+The v2 actor has **152 inputs: two 76-value blocks**. Each block retains 71
+task/proprioceptive channels, replaces all six simulator ball position/velocity channels
+with visual estimates, and appends measurement visibility, normalized track age and a
+three-value search bearing. The bearing points towards the last RGB-measured world
+position in the robot's current root frame. It survives short-track expiry until that
+world resets; it is stale search memory, not a hidden estimate of the ball's current pose.
+Before any visual measurement, the bearing and ball features are zero. Expired ball
+position/velocity features remain zero even when search memory exists.
+
+The separate 142-input critic may use ball truth. Referee turn/phase, root kinematics
+and joint/IMU state remain available; this does not model a full hardware
+odometry/localization stack. Exposure, motion blur and camera/estimator latency have
+not been calibrated to hardware.
+
+## Learn to look before learning to return
+
+The visual curriculum has its own objectives and graduation evidence. It does not
+reuse the teacher curriculum's first lesson or progress:
+
+| Stage | Objective before grounded recovery |
+| --- | --- |
+| 0 — watch | Receive at least 0.30 s of continuous, fresh RGB evidence of the real ball before a head impact. |
+| 1 — receive | Make a legal contact on the raised, camera-facing forehead. |
+| 2 — aim | Return the ball through the virtual partner's measured target disk. |
+| 3 — pair | Complete two actual alternating replies. |
+| 4 — pair | Complete four actual alternating replies. |
+| 5 — pair | Complete eight actual alternating replies with both players' qualified visibility. |
+
+Incoming throws begin ahead of the receiver and vary in flight time, height and target
+offset. A reset sets the initial ball position/velocity; physical gravity and contacts
+determine everything afterwards. No joint is frozen and no neck trajectory is scripted.
+Every objective is followed by the full 0.6 s recovery window; both robots must remain
+supported and stable during its final 0.25 s. A predicted landing score cannot satisfy
+a target crossing or an actual pair return.
+
+Small active-gaze terms reward moving the camera towards the ball even before it enters
+the image, and maintaining RGB evidence after acquisition. Their combined maximum is
+0.20 reward per second, averaged over both robots. Only actual contact and the first
+80 ms after that robot's own strike mask gaze; mere proximity does not. Current physical
+camera poses and ball truth label these rewards. Visibility credit additionally requires
+real RGB detections matched to the ball; projection or a predicted tracker position alone
+cannot earn it. These labels never enter actor features.
+
+Final-stage success requires at least eight replies after the initial strike, followed
+by grounded recovery. In each successful final episode, **each robot** also needs real
+ball visibility for at least 60% of its eligible active-play time, excluding the strike
+grace above. This does not require 100% visibility during impact and does not certify
+an endless rally.
 
 ## Visual training and resume
 
-After camera/pixel tracking validation, the existing driver supports the visual task:
+One command prepares a new v2 warm start, checks sensors, trains, evaluates held-out
+episodes, saves best checkpoints and advances lessons automatically:
 
 ```bash
-nohup uv run --extra viser python scripts/tools/train_microduck_volley.py \
+nohup uv run python scripts/tools/train_microduck_volley.py \
   --vision \
   --checkpoint logs/rsl_rl/microduck_volley_curriculum/2026-10-26_13-12-26-462912/model_1400.pt \
-  --num-envs 32 --iterations 500 --viz viser \
-  > volley_vision.log 2>&1 < /dev/null &
+  --num-envs 32 --iterations 20000 --eval-interval 500 --viz none \
+  > volley_vision_v2.log 2>&1 < /dev/null &
 ```
 
 `--vision` defaults to 32 worlds because two RGB views per world change the GPU workload.
-Actual throughput and memory use have not been measured here. Increase the count only
-after measuring on the target GPU. Visual runs live under `logs/rsl_rl/microduck_volley_vision/`.
+Actual throughput and memory use for this v2 pipeline have not been measured here.
+Increase the count only after measuring on the target GPU. The long-run command is
+headless; for a live Viser UI use `uv run --extra viser` and `--viz viser` instead.
+Visual runs live under `logs/rsl_rl/microduck_volley_vision/`.
 The converter preserves the source actor's mapping when old and visual ball features match,
-inserts initially neutral visibility/age connections, and creates a fresh critic/optimizer.
+inserts initially neutral new feature connections, and creates a fresh critic/optimizer.
 It does not assume that noisy/absent visual estimates preserve the old physical behavior.
 
-The existing first lesson and physical success/recovery criteria remain unchanged. Uploaded
-checks at 500/1000 iterations had zero target crossings; adding vision does not resolve that
-known physical learning failure. Do not interpret a completed visual training budget, fresh
-camera frames or increasing reward as a working volley. The curriculum still requires
-balanced held-out physical success and a separate final test before writing `ready.pt`.
+Before any optimizer update, the driver calls the production sensor probe in the existing
+environment. It checks visible spheres and background rejection for both receiver identities,
+fresh nonconstant RGB, calibration agreement and localization error. It also checks the
+first actual camera exposure of every lesson's normal serve, with no replacement
+fixture, to catch a blind initial distribution before learning. It writes
+`vision_preflight.json` and stops if the sensor check fails. A separate physical preflight
+then checks finite policy stepping, episode/reset records and ankle support.
+
+Every 500 iterations, evaluation collects fixed cohorts with at least 64 complete episodes
+per initial receiver. A lesson advances only after two consecutive evaluations with at
+least 80% full success on **each** side and no more than 5% unsafe episodes. Fast episodes
+cannot replace unfinished worlds in the cohort. Visual objective labels are validated
+independently, so watching, striking and returning cannot exchange success evidence.
+
+`evaluation_*.json` includes per-side `watch_fraction_by_server`, peak visibility duration,
+camera/role visibility, physical failure causes and recovery outcomes. Partial watch
+progress may select a better checkpoint and postpone stagnation, in 5% duration bins;
+it cannot advance a lesson. Training reward alone never selects the best model.
+
+`ready.pt` appears only after the final qualified eight-return/recovery gate and a separate
+held-out test seed pass. `latest.pt` and `stage_*_best.pt` remain intermediate weights.
+Twenty thousand iterations is a maximum budget, not a promise of convergence: the driver
+can stop earlier on a failed preflight, interruption or unresolved stagnation. The current
+v2 preflight and learning behavior have not yet been validated on the target GPU. CPU
+tests and migrated weights do not establish that the robots can play.
+
+Monitor the run with `tail -f volley_vision_v2.log` and its `status.json`. A `stalled` or
+`budget_exhausted` status preserves weights and reports incomplete training; neither is success.
 
 Resume a visual run with its own saved optimizer and sensor contract:
 
 ```bash
 uv run --extra viser python scripts/tools/train_microduck_volley.py \
   --vision --resume logs/rsl_rl/microduck_volley_vision/RUN/latest.pt \
-  --num-envs 32 --iterations 500 --viz viser
+  --num-envs 32 --iterations 20000 --viz viser
 ```
 
-Camera optics, image geometry, timing and tracker settings are stored with the checkpoint.
+This resume command applies only to a current v2 driver checkpoint and adds up to another
+20,000 iterations. Vision-v1 checkpoints must use `--checkpoint` for fresh v2 preparation;
+their old optimizer and lesson progress are incompatible with the new objectives.
+Camera optics, image geometry, timing, tracker/search settings, gaze rates and final
+visibility qualification are stored in **sensor contract version 3** with the checkpoint.
 Incompatible sensor contracts fail explicitly. The evaluator detects visual checkpoints
 automatically, runs the RGB actor, and keeps physical outcome gates separate from cumulative
 perception diagnostics. Direct task playback selects the pair through `play_mode()`; preview
@@ -175,6 +249,7 @@ uv run --extra viser python scripts/tools/view_microduck_vision.py \
 
 Keep the browser connected during that measurement. Comparing `--viz none` with Viser,
 or `--no-head-panels` with the full UI, isolates presentation overhead without learning.
-Camera scheduling is part of sensor contract version 2; a full visual resume carrying
-the older contract is rejected. Ordinary curriculum/legacy weights remain valid inputs
-to the preview's in-memory visual adapter.
+Camera scheduling is part of sensor contract version 3 along with the v2 visual curriculum
+and search memory. A full visual resume carrying an older contract is rejected. Ordinary
+curriculum/legacy weights and vision-v1 weights remain valid inputs to the preview's
+in-memory v2 visual adapter.

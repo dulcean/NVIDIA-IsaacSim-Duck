@@ -21,18 +21,23 @@ from dataclasses import asdict
 from pathlib import Path
 
 CURRICULUM_PROFILE = "microduck_volley_curriculum_v1"
-VISION_PROFILE = "microduck_volley_vision_v1"
+VISION_PROFILE = "microduck_volley_vision_v2"
+LEGACY_VISION_PROFILE = "microduck_volley_vision_v1"
 
 
-def _curriculum_module():
+def _curriculum_module(profile=CURRICULUM_PROFILE):
     """Load the pure curriculum contract without importing all simulator tasks."""
-    name = "isaaclab_tasks.contrib.microduck.volley_curriculum"
+    if profile == CURRICULUM_PROFILE:
+        filename = "volley_curriculum"
+    elif profile == VISION_PROFILE:
+        _curriculum_module(CURRICULUM_PROFILE)
+        filename = "vision_curriculum"
+    else:
+        raise ValueError("Unknown curriculum profile; legacy vision checkpoints need a fresh v2 warm start.")
+    name = f"isaaclab_tasks.contrib.microduck.{filename}"
     if name in sys.modules:
         return sys.modules[name]
-    path = (
-        Path(__file__).resolve().parents[2]
-        / "source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/volley_curriculum.py"
-    )
+    path = Path(__file__).resolve().parents[2] / f"source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/{filename}.py"
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
@@ -44,7 +49,17 @@ def _curriculum_module():
     return module
 
 
-def _validate_record(record: dict, stage: int, spec):
+def _stage_specs(module):
+    """Select the objective-bearing visual stages independently of the teacher contract."""
+    return module.VISION_STAGES if hasattr(module, "VISION_STAGES") else module.STAGES
+
+
+def _state_type(module):
+    """Use the state validator that owns the selected physical/visual objective."""
+    return module.VisionCurriculumState if hasattr(module, "VisionCurriculumState") else module.CurriculumState
+
+
+def _validate_record(record: dict, stage: int, spec, min_gaze_visibility=None):
     """Fail closed if rollout metadata cannot prove the advertised objective."""
     fields = ("env_id", "episode_id", "server", "returns", "stage")
     if any(type(record.get(name)) is not int or record[name] < 0 for name in fields):
@@ -53,6 +68,8 @@ def _validate_record(record: dict, stage: int, spec):
         raise ValueError("Episode record is from a different stage or an unknown receiving side.")
     if record["server"] != record["env_id"] % 2:
         raise ValueError("Held-out evaluation must assign the initial receiver by world-ID parity.")
+    if hasattr(spec, "objective") and record.get("objective") != spec.objective:
+        raise ValueError("Visual episode objective must match the active visual curriculum lesson.")
     if any(type(record.get(name)) is not bool for name in ("success", "unsafe")):
         raise ValueError("Episode success and unsafe outcomes must be booleans.")
     if record["success"] and (record["unsafe"] or record["returns"] < spec.required_returns):
@@ -90,6 +107,19 @@ def _validate_record(record: dict, stage: int, spec):
                 or len(set(reasons)) != len(reasons)
             ):
                 raise ValueError("Diagnostic reasons must be unique, non-empty strings.")
+    for name in ("gaze_visible_a", "gaze_visible_b", "gaze_alignment", "gaze_reward", "watch_visible_s"):
+        if name in record:
+            value = record[name]
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                raise ValueError("Visual progress diagnostics must be finite and non-negative.")
+            if name in ("gaze_visible_a", "gaze_visible_b", "gaze_alignment") and value > 1 + 1e-6:
+                raise ValueError("Visual visibility and alignment diagnostics must be bounded rates.")
+    if min_gaze_visibility is not None and record["success"]:
+        rates = [record.get(name) for name in ("gaze_visible_a", "gaze_visible_b")]
+        if any(type(value) not in (int, float) or not math.isfinite(value) for value in rates):
+            raise ValueError("Final visual success requires measured gaze visibility for both players.")
+        if min(rates) + 1e-6 < min_gaze_visibility:
+            raise ValueError("Final visual success does not meet both players' measured visibility requirement.")
 
 
 def evaluate_policy(
@@ -116,19 +146,30 @@ def evaluate_policy(
     """
     import torch
 
-    curriculum = _curriculum_module()
-    if type(stage) is not int or not 0 <= stage < len(curriculum.STAGES):
+    raw = env.unwrapped
+    profile = getattr(raw.cfg, "curriculum_profile", CURRICULUM_PROFILE)
+    curriculum = _curriculum_module(profile)
+    stages = _stage_specs(curriculum)
+    if type(stage) is not int or not 0 <= stage < len(stages):
         raise ValueError("Evaluation stage is outside the curriculum.")
     if any(type(value) is not int or value < 1 for value in (episodes_per_side, max_steps)):
         raise ValueError("Evaluation episode and step counts must be positive integers.")
-    raw = env.unwrapped
     if not getattr(raw, "evaluation", getattr(raw.cfg, "evaluation", False)):
         raise ValueError("Set the environment to held-out evaluation mode before collecting episodes.")
     if raw.cfg.curriculum_stage != stage:
         raise ValueError("The evaluation environment must use the requested curriculum stage.")
     if env.num_envs < 2:
         raise ValueError("Balanced evaluation requires at least two parallel worlds.")
-    spec = curriculum.STAGES[stage]
+    spec = stages[stage]
+    minimum_visibility = None
+    if hasattr(spec, "objective") and stage == len(stages) - 1:
+        minimum_visibility = getattr(raw.cfg, "final_min_gaze_visibility", 0.60)
+        if (
+            type(minimum_visibility) not in (int, float)
+            or not math.isfinite(minimum_visibility)
+            or not 0 <= minimum_visibility <= 1
+        ):
+            raise ValueError("Final visual visibility qualification must be a finite rate between zero and one.")
     attempts = [0, 0]
     successes = [0, 0]
     records = []
@@ -157,7 +198,7 @@ def evaluate_policy(
                     if hasattr(policy, "reset"):
                         policy.reset(dones)
                     for record in extras.pop("episode_records", []):
-                        _validate_record(record, stage, spec)
+                        _validate_record(record, stage, spec, min_gaze_visibility=minimum_visibility)
                         world = record["env_id"]
                         if world not in remaining:
                             continue
@@ -172,7 +213,9 @@ def evaluate_policy(
             policy.train(was_training)
     unsafe = sum(record["unsafe"] for record in records)
     complete = attempts == [episodes_per_side, episodes_per_side]
-    report = curriculum.EvaluationReport(
+    report_type = curriculum.VisionEvaluationReport if hasattr(spec, "objective") else curriculum.EvaluationReport
+    objective = {"objective": spec.objective} if hasattr(spec, "objective") else {}
+    report = report_type(
         evaluation_id=evaluation_id,
         stage=stage,
         required_returns=spec.required_returns,
@@ -180,6 +223,7 @@ def evaluate_policy(
         successes_by_side=tuple(successes),
         unsafe_episodes=unsafe,
         complete=complete,
+        **objective,
     )
     rates = [success / count if count else 0.0 for success, count in zip(successes, attempts)]
     unsafe_rate = unsafe / len(records) if records else 0.0
@@ -205,7 +249,10 @@ def evaluate_policy(
         "gate_passed": gate_passed,
         "max_steps_reached": not complete,
         "scope": "Fixed held-out episode cohorts; true physical stage success including final recovery.",
+        "profile": profile,
     }
+    if minimum_visibility is not None:
+        metrics["final_min_gaze_visibility"] = minimum_visibility
     diagnostic_fields = (
         "head_hits",
         "head_contacts",
@@ -235,6 +282,37 @@ def evaluate_policy(
             unsafe_reasons=dict(Counter(reason for record in diagnosed for reason in record["unsafe_reasons"])),
             miss_reasons=dict(Counter(reason for record in diagnosed for reason in record["miss_reasons"])),
         )
+    if hasattr(spec, "objective"):
+        fields = ("gaze_visible_a", "gaze_visible_b", "gaze_alignment", "gaze_reward", "watch_visible_s")
+        visual = [record for record in records if all(name in record for name in fields)]
+        metrics["visual_diagnostic_episodes"] = len(visual)
+        if visual:
+            duration = getattr(raw.cfg, "watch_duration", 0.30)
+            if not math.isfinite(duration) or duration <= 0:
+                raise ValueError("Visual watch duration must be finite and positive.")
+            per_side = [[record for record in visual if record["server"] == side] for side in (0, 1)]
+            metrics.update(
+                watch_fraction_by_server=[
+                    sum(min(record["watch_visible_s"] / duration, 1.0) for record in group) / len(group)
+                    if group
+                    else 0.0
+                    for group in per_side
+                ],
+                watch_visible_s_by_server=[
+                    sum(record["watch_visible_s"] for record in group) / len(group) if group else 0.0
+                    for group in per_side
+                ],
+                gaze_visible_by_camera=[
+                    sum(record[f"gaze_visible_{side}"] for record in visual) / len(visual) for side in ("a", "b")
+                ],
+                gaze_visible_by_role={
+                    role: sum(record[f"gaze_visible_{('a', 'b')[record['server'] ^ other]}"] for record in visual)
+                    / len(visual)
+                    for role, other in (("receiver", 0), ("partner", 1))
+                },
+                mean_gaze_alignment=sum(record["gaze_alignment"] for record in visual) / len(visual),
+                mean_gaze_reward=sum(record["gaze_reward"] for record in visual) / len(visual),
+            )
     return report, metrics
 
 
@@ -247,12 +325,17 @@ def collect(args: argparse.Namespace) -> dict:
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     metadata = (checkpoint.get("infos") or {}).get("microduck_curriculum", {})
     profile = metadata.get("profile")
+    if profile == LEGACY_VISION_PROFILE:
+        raise ValueError(
+            "Vision-v1 checkpoints require prepare_microduck_vision_checkpoint.py before v2 evaluation; "
+            "the new visual objectives and 152-value actor are a fresh warm start."
+        )
     if profile not in (CURRICULUM_PROFILE, VISION_PROFILE):
         raise ValueError("Convert the source checkpoint for the curriculum or vision task first.")
     stage = args.stage
     if stage is None:
         stage = metadata.get("curriculum_state", metadata.get("state", {})).get("stage", metadata.get("stage"))
-    if type(stage) is not int or not 0 <= stage < len(_curriculum_module().STAGES):
+    if type(stage) is not int or not 0 <= stage < len(_stage_specs(_curriculum_module(profile))):
         raise ValueError("Supply --stage for a prepared checkpoint without saved curriculum progress.")
 
     from rsl_rl.runners import OnPolicyRunner

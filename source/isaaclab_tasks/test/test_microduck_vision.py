@@ -10,6 +10,9 @@ camera motion and isolated reset behavior. It does not claim that an untrained
 policy plays volleyball or that alpha-family optics calibrate a particular robot.
 """
 
+import importlib.util
+from pathlib import Path
+
 import gymnasium as gym
 import pytest
 import torch
@@ -28,7 +31,7 @@ from isaaclab_assets.robots.microduck import MICRODUCK_JOINT_NAMES
 
 def _assert_finite_step(env, actions):
     observations, reward, terminated, truncated, extras = env.step(actions)
-    assert observations["policy"].shape == (2, 146)
+    assert observations["policy"].shape == (2, 152)
     assert observations["critic"].shape == (2, 142)
     assert torch.isfinite(observations["policy"]).all()
     assert torch.isfinite(observations["critic"]).all()
@@ -51,7 +54,7 @@ def test_microduck_real_head_rgb_tracking_motion_and_partial_reset(device):
     env = gym.make(task, cfg=cfg).unwrapped
     try:
         observations, _ = env.reset()
-        assert observations["policy"].shape == (2, 146)
+        assert observations["policy"].shape == (2, 152)
         assert observations["critic"].shape == (2, 142)
         assert torch.isfinite(observations["policy"]).all()
         assert torch.isfinite(observations["critic"]).all()
@@ -120,11 +123,20 @@ def test_microduck_real_head_rgb_tracking_motion_and_partial_reset(device):
             assert ((after - before).norm(dim=-1) > 1e-4).all()
             assert (camera.frame.torch > old_frame).all()
 
-        # Controlled initial conditions put a real sphere 25 cm in front of
-        # A/world 0 and B/world 1. Thereafter gravity and contacts act normally;
-        # no position, velocity or ground-truth hint is fed to either tracker.
-        env.reset()
+        # Run the actual startup gate used by training, including off-screen
+        # negative controls, real-pixel localization and calibrated K/D checks.
+        path = Path(__file__).resolve().parents[3] / "scripts/tools/check_microduck_vision.py"
+        spec = importlib.util.spec_from_file_location("microduck_vision_preflight", path)
+        preflight = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(preflight)
+        report = preflight.check_vision_sensors(env)
+        assert report["passed"], report
+        assert env.stage == 0 and env.evaluation
         assert all(not track.valid.any() for track in env.vision_tracks)
+
+        # Establish real tracks again solely as the initial state for the
+        # independent partial-reset contract. Localization accuracy is owned
+        # by the production preflight above, rather than repeated here.
         pose = env._ball.data.root_link_pose_w.torch.clone()
         for player, camera in enumerate(env.head_cameras):
             data = camera.data
@@ -138,23 +150,13 @@ def test_microduck_real_head_rgb_tracking_motion_and_partial_reset(device):
         env._ball.write_root_velocity_to_sim_index(root_velocity=torch.zeros(2, 6, device=device))
         for camera in env.head_cameras:
             camera.reset()
-        measurements_before = env.vision_diagnostics()["accepted_rgb_measurements"]
         actions.zero_()
-        located = torch.zeros(2, dtype=torch.bool, device=device)
         for _ in range(5):
             _, terminated, truncated, _ = _assert_finite_step(env, actions)
             assert not terminated.any() and not truncated.any()
-            for player, track in enumerate(env.vision_tracks):
-                error = (track.position_w[player] - env._ball.data.root_link_pos_w.torch[player]).norm()
-                located[player] |= track.valid[player] & (error < 0.04)
-            if located.all():
+            if all(track.valid[player] for player, track in enumerate(env.vision_tracks)):
                 break
-        measurements_after = env.vision_diagnostics()["accepted_rgb_measurements"]
-        assert all(after > before for before, after in zip(measurements_before, measurements_after)), (
-            "A native RGB camera never produced an accepted orange-sphere measurement."
-        )
-        assert located.all(), "A rendered sphere's monocular estimate missed its physical position by 4 cm."
-        assert env.vision_tracks[1].valid[1]
+        assert all(track.valid[player] for player, track in enumerate(env.vision_tracks))
 
         # A physical inversion terminates only world 0. Its selected tracking
         # state and stale-frame cache must clear; B/world 1 must retain vision.
@@ -175,7 +177,7 @@ def test_microduck_real_head_rgb_tracking_motion_and_partial_reset(device):
         ), "A capture from the intermediate reset state must not become a new visual measurement."
         assert env._last_camera_frames[1][1] >= retained_frame > 0
         assert not observations["policy"][0, 61:67].any()
-        assert not observations["policy"][0, 134:140].any()
+        assert not observations["policy"][0, 137:143].any()
     finally:
         env.close()
         SimulationContext.clear_instance()

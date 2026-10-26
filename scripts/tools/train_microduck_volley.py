@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import os
 import shutil
 import sys
@@ -34,18 +35,31 @@ def progress_score(metrics):
     """Select progress by physical outcomes; reward and value loss cannot select the best model."""
     if not metrics["complete"]:
         return None
-    return (
+    score = (
         min(metrics["success_rate_by_side"])
         + 0.1 * metrics.get("goal_reached_rate", 0.0)
         - 0.1 * metrics["unsafe_rate"]
         + 0.01 * metrics.get("mean_launch_quality", 0.0)
     )
+    if metrics.get("objective") == "watch_visible_ball":
+        fractions = metrics.get("watch_fraction_by_server", (0.0, 0.0))
+        if len(fractions) != 2 or any(not math.isfinite(value) or not 0 <= value <= 1 for value in fractions):
+            raise ValueError("Visual selection needs two bounded, finite held-out watch fractions.")
+        # One 64-episode success increment exceeds this whole bonus. Quantization
+        # prevents tiny changes in partial visibility from repeatedly resetting stagnation.
+        score += 0.01 * (math.floor(min(fractions) * 20 + 1e-6) / 20)
+    return score
 
 
 def resume_metadata(checkpoint, profile):
     """Refuse legacy weights or incomplete curriculum state as a full training resume."""
     infos = checkpoint.get("infos") or {}
     metadata = infos.get("microduck_curriculum", {}) if isinstance(infos, dict) else {}
+    if isinstance(metadata, dict) and metadata.get("profile") == "microduck_volley_vision_v1":
+        raise ValueError(
+            "Vision-v1 weights require --checkpoint for a fresh v2 warm start; "
+            "their optimizer and teacher-era lesson progress cannot be resumed."
+        )
     if not isinstance(metadata, dict) or metadata.get("profile") != profile or "curriculum_state" not in metadata:
         raise ValueError(
             "--resume requires a checkpoint saved by this curriculum driver; use --checkpoint to warm start."
@@ -74,8 +88,9 @@ def resume_metadata(checkpoint, profile):
         raise ValueError("Invalid or inconsistent resume iteration counts.")
     try:
         saved = metadata["curriculum_state"]
-        contract = _tool("evaluate_microduck_volley")._curriculum_module()
-        validator = contract.CurriculumState(**saved["gate"])
+        evaluator = _tool("evaluate_microduck_volley")
+        contract = evaluator._curriculum_module(profile)
+        validator = evaluator._state_type(contract)(**saved["gate"])
         validator.load_state_dict(saved)
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("Incomplete or incompatible curriculum state.") from error
@@ -83,6 +98,10 @@ def resume_metadata(checkpoint, profile):
         not validator.complete
         or not isinstance(metadata.get("certification"), dict)
         or not metadata["certification"].get("gate_passed", False)
+        or (
+            hasattr(validator.spec, "objective")
+            and metadata["certification"].get("objective") != validator.spec.objective
+        )
     ):
         raise ValueError("A certified checkpoint needs a completed curriculum and passing independent test.")
     return metadata
@@ -92,6 +111,7 @@ def _task_components(vision):
     """Load one complete observation/profile contract before constructing the simulation."""
     if vision:
         from isaaclab_tasks.contrib.microduck.agents.ball_ppo_cfg import MicroDuckVolleyVisionPPORunnerCfg as AgentCfg
+        from isaaclab_tasks.contrib.microduck.vision_curriculum import VisionCurriculumState as State
         from isaaclab_tasks.contrib.microduck.volley_vision_env import MicroDuckVolleyVisionEnv as Environment
         from isaaclab_tasks.contrib.microduck.volley_vision_env_cfg import MicroDuckVolleyVisionEnvCfg as EnvCfg
 
@@ -103,6 +123,7 @@ def _task_components(vision):
         from isaaclab_tasks.contrib.microduck.agents.ball_ppo_cfg import (
             MicroDuckVolleyCurriculumPPORunnerCfg as AgentCfg,
         )
+        from isaaclab_tasks.contrib.microduck.volley_curriculum import CurriculumState as State
         from isaaclab_tasks.contrib.microduck.volley_curriculum_env import MicroDuckVolleyCurriculumEnv as Environment
         from isaaclab_tasks.contrib.microduck.volley_curriculum_env_cfg import MicroDuckVolleyCurriculumEnvCfg as EnvCfg
 
@@ -110,12 +131,22 @@ def _task_components(vision):
         prepare_weights = prepare.prepare_curriculum_checkpoint
         profile = prepare.CURRICULUM_PROFILE
         experiment = "microduck_volley_curriculum"
-    return EnvCfg, Environment, AgentCfg, prepare_weights, profile, experiment
+    return EnvCfg, Environment, AgentCfg, prepare_weights, profile, experiment, State
 
 
 def _vision_metrics(env, vision):
     """Keep runtime perception diagnostics separate from curriculum outcome counts."""
     return {"vision": env.vision_diagnostics()} if vision else {}
+
+
+def _sensor_preflight(env, run_dir, vision):
+    """Fail before learning if controlled RGB localization/background probes fail."""
+    if not vision:
+        return
+    report = _tool("check_microduck_vision").check_vision_sensors(env)
+    (run_dir / "vision_preflight.json").write_text(json.dumps(report, indent=2) + "\n")
+    if report.get("passed") is not True:
+        raise RuntimeError("RGB sensor preflight failed; no training was started. Inspect vision_preflight.json.")
 
 
 def train(args):
@@ -133,11 +164,9 @@ def train(args):
 
     from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
-    from isaaclab_tasks.contrib.microduck.volley_curriculum import CurriculumState
-
-    EnvCfg, Environment, AgentCfg, prepare_weights, profile, experiment = _task_components(args.vision)
+    EnvCfg, Environment, AgentCfg, prepare_weights, profile, experiment, State = _task_components(args.vision)
     evaluator = _tool("evaluate_microduck_volley")
-    state = CurriculumState(min_attempts_per_side=args.eval_episodes_per_side)
+    state = State(min_attempts_per_side=args.eval_episodes_per_side)
     run_dir = args.output or Path("logs/rsl_rl") / experiment / datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
     run_dir.mkdir(parents=True, exist_ok=False)
     torch.manual_seed(args.seed)
@@ -237,6 +266,9 @@ def train(args):
             )
             runner.current_learning_iteration = total
             runner.save(str(run_dir / "latest.pt"))
+            status.update(status="vision_preflight" if args.vision else "preflight", profile=profile, stage=state.stage)
+            save_status()
+            _sensor_preflight(wrapped, run_dir, args.vision)
             policy = runner.get_inference_policy(device=args.device)
             # Exercise full physical episodes and auto-reset metadata, not just the frames before a serve arrives.
             devices = [torch.device(args.device).index or 0] if args.device.startswith("cuda") else []
@@ -249,7 +281,14 @@ def train(args):
                     if not torch.isfinite(obs["policy"]).all() or not torch.isfinite(reward).all():
                         raise RuntimeError("GPU preflight produced nonfinite observations or reward.")
                     for record in env.extras.pop("episode_records", []):
-                        evaluator._validate_record(record, state.stage, state.spec)
+                        evaluator._validate_record(
+                            record,
+                            state.stage,
+                            state.spec,
+                            min_gaze_visibility=cfg.final_min_gaze_visibility
+                            if args.vision and state.stage == len(state.stages) - 1
+                            else None,
+                        )
                         if record["env_id"] in (0, 1):
                             seen.add(record["server"])
                     for player, (sensor, feet) in enumerate(zip(env._sensors, env._feet)):
@@ -320,6 +359,7 @@ def train(args):
                             "evaluation": evaluation_id,
                             "stage": int(key),
                             "decision": decision.status,
+                            "objective": metrics.get("objective", "teacher_return"),
                             "success": metrics["success_rate_by_side"],
                             "unsafe": metrics["unsafe_rate"],
                         }

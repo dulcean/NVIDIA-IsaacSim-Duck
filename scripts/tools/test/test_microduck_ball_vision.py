@@ -121,6 +121,17 @@ def test_occlusion_prediction_expiry_and_partial_reset():
     result = tracker.predict(0.12)
     assert not result.valid.any() and not result.position_w.any() and not result.velocity_w.any()
     assert not result.confidence.any()
+    assert result.seen.tolist() == [False, True]
+    torch.testing.assert_close(result.last_seen_position_w[1], initial.position_w[1])
+    # The search bearing survives expiry without reintroducing a usable ball pose.
+    root_positions = torch.zeros(2, 2, 3)
+    root_quats = torch.tensor([[[0.0, 0.0, 0.0, 1.0]] * 2] * 2)
+    actor = vision.visual_actor_observations(
+        torch.zeros(2, 142), [result, result], root_positions, root_quats, root_positions
+    ).view(2, 2, 76)
+    assert not actor[:, :, 61:67].any()
+    assert not actor[0, :, 73:76].any()
+    torch.testing.assert_close(actor[1, :, 73:76], torch.tensor([[0.0, 0.0, 1.0]] * 2), atol=0.01, rtol=0)
     # A stale frame after reset cannot initialize the selected world.
     result = tracker.update(rgb, intrinsic, *poses(2), measurement_mask=torch.tensor([False, True]))
     assert result.visible.tolist() == [False, True]
@@ -225,7 +236,7 @@ def test_actor_ball_features_depend_only_on_visual_tracks_and_each_robots_frame(
         changed_truth, [first, second], root_position, root_quat, root_velocity
     )
     torch.testing.assert_close(actor, independent, rtol=0, atol=0)
-    result = actor.view(2, 2, 73)
+    result = actor.view(2, 2, 76)
     original = privileged.view(2, 2, 71)
     torch.testing.assert_close(result[:, :, :61], original[:, :, :61])
     torch.testing.assert_close(result[:, :, 67:71], original[:, :, 67:71])

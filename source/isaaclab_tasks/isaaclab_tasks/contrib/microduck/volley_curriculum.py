@@ -85,6 +85,8 @@ class CurriculumState:
     or recover a saved best checkpoint; they never promote or demote a stage.
     """
 
+    stages = STAGES
+
     def __init__(
         self,
         stage: int = 0,
@@ -95,7 +97,7 @@ class CurriculumState:
         passes_required: int = 2,
         stall_evaluations: int = 4,
     ):
-        if type(stage) is not int or not 0 <= stage < len(STAGES):
+        if type(stage) is not int or not 0 <= stage < len(self.stages):
             raise ValueError("Curriculum stage is outside the supported range.")
         if any(
             type(value) is not int or value < 1 for value in (min_attempts_per_side, passes_required, stall_evaluations)
@@ -119,7 +121,7 @@ class CurriculumState:
     @property
     def spec(self) -> StageSpec:
         """The scene/reset contract for the current stage."""
-        return STAGES[self.stage]
+        return self.stages[self.stage]
 
     def update_evaluation(self, report: EvaluationReport) -> CurriculumDecision:
         """Validate fresh counts and update the held-out pass streak once."""
@@ -150,7 +152,7 @@ class CurriculumState:
         if self.consecutive_passes < self.passes_required:
             return CurriculumDecision("passed", "Another independent held-out pass is required.", self.stage, False)
         self.consecutive_passes = 0
-        if self.stage == len(STAGES) - 1:
+        if self.stage == len(self.stages) - 1:
             self.complete = True
             return CurriculumDecision(
                 "complete", "The final unassisted rally and recovery gate passed.", self.stage, True
@@ -193,7 +195,7 @@ class CurriculumState:
         """Serialize progress with its gate and stage contracts for safe resumption."""
         return {
             "version": 1,
-            "stages": [asdict(spec) for spec in STAGES],
+            "stages": [asdict(spec) for spec in self.stages],
             "gate": self._gate_settings(),
             "stage": self.stage,
             "consecutive_passes": self.consecutive_passes,
@@ -208,15 +210,15 @@ class CurriculumState:
             raise ValueError("Saved curriculum version or evaluation gates do not match.")
         # JSON converts tuple-valued ranges to lists, so compare a normalized form.
         saved_stages = state.get("stages", [])
-        if len(saved_stages) != len(STAGES):
+        if len(saved_stages) != len(self.stages):
             raise ValueError("Saved curriculum stage definitions do not match.")
-        for saved, expected in zip(saved_stages, STAGES):
+        for saved, expected in zip(saved_stages, self.stages):
             candidate = dict(saved)
             for key in ("lateral_range", "flight_time_range"):
                 candidate[key] = tuple(candidate.get(key, ()))
             if candidate != asdict(expected):
                 raise ValueError("Saved curriculum stage definitions do not match.")
-        candidate = CurriculumState(
+        candidate = type(self)(
             stage=state["stage"], consecutive_passes=state["consecutive_passes"], **self._gate_settings()
         )
         for key, minimum in (("failed_evaluations", 0), ("last_evaluation_id", -1)):
@@ -224,7 +226,7 @@ class CurriculumState:
             if type(value) is not int or value < minimum:
                 raise ValueError(f"Invalid saved curriculum field: {key}.")
             setattr(candidate, key, value)
-        if type(state["complete"]) is not bool or (state["complete"] and candidate.stage != len(STAGES) - 1):
+        if type(state["complete"]) is not bool or (state["complete"] and candidate.stage != len(self.stages) - 1):
             raise ValueError("Only the final curriculum stage may be marked complete.")
         candidate.complete = state["complete"]
         self.__dict__.update(candidate.__dict__)

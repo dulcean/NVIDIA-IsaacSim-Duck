@@ -38,6 +38,8 @@ class VisualBallTracks:
     age: torch.Tensor
     valid: torch.Tensor
     confidence: torch.Tensor
+    last_seen_position_w: torch.Tensor | None = None
+    seen: torch.Tensor | None = None
 
 
 def visual_actor_observations(
@@ -53,7 +55,9 @@ def visual_actor_observations(
     ``privileged`` contains two legacy 71-value player blocks. Simulator ball
     channels 61:67 are always overwritten, including when a track is absent.
     Other robot/task channels are preserved. Each output block adds accepted
-    measurement visibility and normalized age, producing 146 actor features.
+    measurement visibility, normalized age and the last observed bearing,
+    producing 152 actor features. A stale bearing remains a search hint after
+    the position estimate expires; it never becomes a valid ball position.
     World camera/root kinematics are calibrated odometry inputs; no ball truth
     or privileged ball-derived fallback is used for missing measurements.
     """
@@ -82,7 +86,17 @@ def visual_actor_observations(
         local = vectors + quat[:, None, 3:] * first + torch.cross(inverse_vector, first, dim=-1)
         blocks[:, player, 61:67] = torch.where(valid[:, None], local.flatten(1), 0.0)
         age = torch.where(valid, track.age / max_age, 1.0).clamp(0, 1)
-        actor.append(torch.cat((blocks[:, player], (track.visible & valid).float()[:, None], age[:, None]), dim=-1))
+        last_position = track.last_seen_position_w if track.last_seen_position_w is not None else track.position_w
+        seen = track.seen if track.seen is not None else track.valid
+        delta = torch.nan_to_num(last_position - position)
+        inverse = -quat[:, :3]
+        cross = 2 * torch.cross(inverse, delta, dim=-1)
+        bearing = delta + quat[:, 3:] * cross + torch.cross(inverse, cross, dim=-1)
+        bearing = F.normalize(bearing, dim=-1)
+        bearing = torch.where((seen & torch.isfinite(last_position).all(-1))[:, None], bearing, 0.0)
+        actor.append(
+            torch.cat((blocks[:, player], (track.visible & valid).float()[:, None], age[:, None], bearing), dim=-1)
+        )
     return torch.cat(actor, dim=-1)
 
 
@@ -133,6 +147,8 @@ class BallVisualTracker:
         self.age = torch.zeros(num_envs, device=self.device)
         self.confidence = torch.zeros_like(self.age)
         self._last_measurement = torch.zeros_like(self.position_w)
+        self.last_seen_position_w = torch.zeros_like(self.position_w)
+        self.seen = torch.zeros_like(self.visible)
         self._measurement_confidence = torch.zeros_like(self.age)
         self._acceleration = self.position_w.new_tensor((0.0, 0.0, -9.81))
         self._pixel_cache = {}
@@ -150,6 +166,8 @@ class BallVisualTracker:
             self.confidence,
             self._last_measurement,
             self._measurement_confidence,
+            self.last_seen_position_w,
+            self.seen,
         ):
             value[env_ids] = 0
 
@@ -278,7 +296,16 @@ class BallVisualTracker:
         return VisualBallTracks(
             *(
                 value.clone()
-                for value in (self.position_w, self.velocity_w, self.visible, self.age, self.valid, self.confidence)
+                for value in (
+                    self.position_w,
+                    self.velocity_w,
+                    self.visible,
+                    self.age,
+                    self.valid,
+                    self.confidence,
+                    self.last_seen_position_w,
+                    self.seen,
+                )
             )
         )
 
@@ -321,6 +348,8 @@ class BallVisualTracker:
         self.velocity_w = torch.where(accepted.unsqueeze(-1), measured_velocity, predicted_velocity)
         self.age = torch.where(accepted, 0.0, elapsed)
         self._last_measurement = torch.where(accepted.unsqueeze(-1), measurement, self._last_measurement)
+        self.last_seen_position_w = torch.where(accepted.unsqueeze(-1), measurement, self.last_seen_position_w)
+        self.seen |= accepted
         self._measurement_confidence = torch.where(accepted, confidence, self._measurement_confidence)
         self.confidence = torch.where(
             accepted, confidence, self._measurement_confidence * (1 - self.age / self.max_age)
