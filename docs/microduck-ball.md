@@ -210,6 +210,37 @@ play/resume commands, since its experiment directory differs from the task's def
 
 ## Check scene scale and passive ball physics before another long run
 
+### Trace inaccurate second strikes and subsequent collapse
+
+When video shows a repeatable first transfer but a poor second strike, collect one-world
+inference traces before changing rewards again. This tool uses the task's current default
+scene/rewards/reset rules, loads only the saved RSL-RL actor, and performs no learning.
+It uses no visualizer and writes local reports without modifying the checkpoint:
+
+```bash
+CHECKPOINT="$(ls -t logs/rsl_rl/microduck_volley_post_rally_20k/*/model_*.pt | head -n 1)"
+uv run python scripts/tools/trace_microduck_volley.py \
+  --checkpoint "$CHECKPOINT" --episodes 30
+```
+
+Outputs are `logs/microduck_volley_trace.json` and the matching `.csv`. The CSV includes
+5 ms physics states, candidate strike onsets, root positions/velocities, torso tilt,
+head orientations/positions, initial forehead targets, phase flags, and pre-reset
+terminal snapshots. The JSON compares first/second/later candidate strikes and includes
+per-strike details and overlapping terminal-reason fractions. Default seed is 42;
+record the checkout revision with the reports, since it selects the current environment rules.
+
+The projected landing error is a diagnostic prediction towards the receiver's **initial**
+forehead position, rather than its possibly displaced current head. Velocity is sampled
+at least 20 ms after impact; an intervening head-contact onset, terminal, or reset makes
+that estimate unavailable. Ongoing contact at the sample time and receiver motion can
+invalidate a free-flight approximation. Candidate hits are sampled before control-step
+safety checks, which may cancel their actual reward. Simultaneous candidate strikes are
+reported as ambiguous and excluded from first-versus-second comparisons. Torso tilt/drift
+within 250 ms after a strike includes later strikes but cannot cross an episode reset.
+Use the raw CSV to locate the sequence of ball misdirection, torso acceleration, center
+crossing and falling; the summary alone does not establish which event caused another.
+
 ### Fine-tune recovery on the original scene
 
 The volley task pays only `0.2` immediately for each legal strike. The other `0.8`,
