@@ -49,3 +49,16 @@ class MicroDuckVolleyPPORunnerCfg(MicroDuckHeadingPPORunnerCfg):
 
     experiment_name = "microduck_volley"
     actor = MicroDuckHeadingPPORunnerCfg().actor.replace(hidden_dims=[1024, 512, 256])
+
+
+@configclass
+class MicroDuckVolleyCurriculumPPORunnerCfg(MicroDuckVolleyPPORunnerCfg):
+    """The same trainable actor across receive/recover lessons and unassisted pair stages."""
+
+    experiment_name = "microduck_volley_curriculum"
+    save_interval = 100
+    algorithm = MicroDuckVolleyPPORunnerCfg().algorithm.replace(
+        gamma=0.995,
+        learning_rate=0.00005,
+        desired_kl=0.003,
+    )

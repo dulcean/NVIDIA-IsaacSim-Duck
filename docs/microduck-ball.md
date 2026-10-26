@@ -1,5 +1,9 @@
 # MicroDuck: heading and cooperative volleyball
 
+For automatic receive/recover/pair training, use the
+[volleyball curriculum](microduck-volley-curriculum.md). The commands below describe the
+earlier experimental tasks and ablations, which do not advance the new curriculum.
+
 Experimental tasks for the NVIDIA training host. Development and CPU checkpoint checks can run elsewhere;
 the Newton/MJWarp scene, contact behavior, and learned performance must be validated on the GPU host.
 
