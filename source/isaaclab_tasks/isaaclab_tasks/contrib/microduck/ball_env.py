@@ -15,7 +15,16 @@ from isaaclab.utils.math import quat_apply, quat_apply_inverse
 from isaaclab_assets.robots.microduck import MICRODUCK_JOINT_NAMES
 
 from .ball_env_cfg import MicroDuckHeadingEnvCfg
-from .ball_rules import PostRallyRecovery, RecoveryRewards, balance_errors, classify_head_contact, robot_collision_mask
+from .ball_rules import (
+    PostRallyRecovery,
+    RecoveryRewards,
+    SustainedCompression,
+    balance_errors,
+    center_approach_error,
+    classify_head_contact,
+    launch_quality,
+    robot_collision_mask,
+)
 from .heading_geometry import camera_alignment, front_strike_mask
 
 
@@ -73,6 +82,13 @@ class MicroDuckBallEnv(DirectRLEnv):
 
         shape = (self.num_envs, cfg.num_players)
         self._recovery = RecoveryRewards(self.num_envs, cfg.num_players, self.device)
+        self._compression = SustainedCompression(self.num_envs, cfg.num_players, self.device)
+        self._home_heads = torch.zeros(*shape, 3, device=self.device)
+        self._min_root_height = torch.full((self.num_envs,), float("inf"), device=self.device)
+        self._max_inward_speed = torch.zeros(self.num_envs, device=self.device)
+        self._low_torso = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self._serve_quality = torch.zeros(self.num_envs, device=self.device)
+        self._reply_quality = torch.zeros_like(self._serve_quality)
         self._post_rally = PostRallyRecovery(self.num_envs, self.device)
         self._post_recovered = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         self._fell_after_miss = torch.zeros_like(self._post_recovered)
@@ -83,6 +99,8 @@ class MicroDuckBallEnv(DirectRLEnv):
         self._player_hit_event = torch.zeros(*shape, device=self.device)
         self._player_aim_event = torch.zeros_like(self._player_hit_event)
         self._player_return_event = torch.zeros_like(self._player_hit_event)
+        self._player_directed_return_event = torch.zeros_like(self._player_hit_event)
+        self._player_serve_quality_event = torch.zeros_like(self._player_hit_event)
         self._recovered_hits = torch.zeros(self.num_envs, device=self.device)
         self._recovery_reward_sum = torch.zeros_like(self._recovered_hits)
         self._actions = torch.zeros(*shape, 14, device=self.device)
@@ -147,12 +165,20 @@ class MicroDuckBallEnv(DirectRLEnv):
             data = robot.data
             height = data.root_link_pos_w.torch[:, 2] - self.scene.env_origins[:, 2]
             initial_height = data.default_root_pose.torch[:, 2]
+            height_ratio = (
+                self.cfg.recovered_height_ratio if self.cfg.enable_root_recovery else self.cfg.recovery_min_height_ratio
+            )
             stable.append(
                 (-data.projected_gravity_b.torch[:, 2] >= self.cfg.recovery_min_upright)
                 & (data.root_link_ang_vel_b.torch[:, :2].norm(dim=-1) <= self.cfg.recovery_max_tumbling)
-                & (height >= initial_height * self.cfg.recovery_min_height_ratio)
+                & (height >= initial_height * height_ratio)
                 & (height <= initial_height + self.cfg.recovery_max_height_offset)
                 & (data.root_link_lin_vel_w.torch[:, 2].abs() <= self.cfg.recovery_max_vertical_speed)
+                & (
+                    (data.root_link_lin_vel_w.torch[:, :2].norm(dim=-1) <= self.cfg.recovered_max_planar_speed)
+                    if self.cfg.enable_root_recovery
+                    else True
+                )
             )
         return torch.stack(stable, dim=1)
 
@@ -165,6 +191,8 @@ class MicroDuckBallEnv(DirectRLEnv):
         self._player_hit_event.zero_()
         self._player_aim_event.zero_()
         self._player_return_event.zero_()
+        self._player_directed_return_event.zero_()
+        self._player_serve_quality_event.zero_()
         self._fast_event.zero_()
         self._invalid.zero_()
         self._robot_collision.zero_()
@@ -230,6 +258,9 @@ class MicroDuckBallEnv(DirectRLEnv):
                 raise RuntimeError("Filtered robot-to-robot contact forces are required in the volley task.")
             self._robot_collision |= robot_collision_mask(robot_forces.torch, self.cfg.robot_contact_threshold)
         receivers = self._receivers()
+        aim_targets = (
+            self._home_heads.flip(1) if self.cfg.enable_directed_returns and self.cfg.num_players == 2 else receivers
+        )
         ball_pos = self._ball.data.root_link_pos_w.torch
         ball_vel = self._ball.data.root_link_lin_vel_w.torch
         for i, (robot, sensor, head_mask, body) in enumerate(
@@ -282,15 +313,18 @@ class MicroDuckBallEnv(DirectRLEnv):
             self._return_event += transfer.float()
             self._player_hit_event[:, i] += valid.float()
             self._player_return_event[:, i] += transfer.float()
-            # Ballistic aim towards the receiver's current head height, on the descending arc.
-            discriminant = ball_vel[:, 2].square() + 2 * 9.81 * (ball_pos[:, 2] - receivers[:, i, 2])
-            flight = (ball_vel[:, 2] + discriminant.clamp_min(0).sqrt()) / 9.81
-            landing = ball_pos[:, :2] + ball_vel[:, :2] * flight.unsqueeze(-1)
-            error = (landing - receivers[:, i, :2]).square().sum(dim=-1)
-            quality = torch.exp(-error / self.cfg.receiver_radius**2)
-            quality *= (discriminant > 0) & (ball_vel[:, 2] > 0.1) & (flight > self.cfg.min_transfer_time)
+            quality = launch_quality(
+                ball_pos,
+                ball_vel,
+                aim_targets[:, i],
+                self.cfg.receiver_radius,
+                self.cfg.min_transfer_time,
+                self.cfg.enable_directed_returns,
+            )
             self._aim_event += valid.float() * quality
             self._player_aim_event[:, i] += valid.float() * quality
+            self._player_directed_return_event[:, i] += transfer.float() * quality
+            self._player_serve_quality_event[:, i] += (valid & ~previous).float() * quality
             self._last_hitter[valid] = i
             self._since_hit[valid] = 0
             self._contact[:, i] = head_contact
@@ -365,6 +399,10 @@ class MicroDuckBallEnv(DirectRLEnv):
         self._player_hit_event *= legal.unsqueeze(-1)
         self._player_aim_event *= legal.unsqueeze(-1)
         self._player_return_event *= legal.unsqueeze(-1)
+        self._player_directed_return_event *= legal.unsqueeze(-1)
+        self._player_serve_quality_event *= legal.unsqueeze(-1)
+        self._serve_quality += self._player_serve_quality_event.sum(-1)
+        self._reply_quality += self._player_directed_return_event.sum(-1)
         self._hits += self._hit_event
         self._returns += self._return_event
         self._fast_returns += self._fast_event * legal
@@ -409,6 +447,36 @@ class MicroDuckBallEnv(DirectRLEnv):
             torch.stack([r.data.projected_gravity_b.torch for r in self._robots], dim=1),
             torch.stack([r.data.root_link_ang_vel_b.torch for r in self._robots], dim=1),
         )
+        heights = torch.stack(
+            [r.data.root_link_pos_w.torch[:, 2] - self.scene.env_origins[:, 2] for r in self._robots], dim=1
+        )
+        self._min_root_height = torch.minimum(self._min_root_height, heights.amin(-1))
+        root_cost = torch.zeros_like(tilt)
+        if self.cfg.enable_root_recovery:
+            compression = self._compression.step(
+                heights,
+                torch.stack([r.data.default_root_pose.torch[:, 2] for r in self._robots], dim=1),
+                torch.stack([r.data.root_link_lin_vel_w.torch[:, 2] for r in self._robots], dim=1),
+                self.step_dt,
+                self.cfg.compression_height_ratio,
+                self.cfg.compression_grace,
+                self.cfg.compression_takeoff_speed,
+            )
+            self._low_torso |= (compression > 0).any(-1)
+            root_cost += self.cfg.compression_cost * compression.amax(-1)
+            if self.cfg.num_players == 2:
+                signs = heights.new_tensor([1.0, -1.0])
+                position = (
+                    torch.stack(
+                        [r.data.root_link_pos_w.torch[:, 0] - self.scene.env_origins[:, 0] for r in self._robots], dim=1
+                    )
+                    * signs
+                )
+                speed = torch.stack([r.data.root_link_lin_vel_w.torch[:, 0] for r in self._robots], dim=1) * signs
+                self._max_inward_speed = torch.maximum(self._max_inward_speed, speed.clamp_min(0).amax(-1))
+                root_cost += self.cfg.center_approach_cost * center_approach_error(
+                    position, speed, self.cfg.center_buffer, self.cfg.center_lookahead
+                ).amax(-1)
         rate = (self._actions - self._previous_actions).square().sum(dim=(1, 2))
         limits_cost = torch.zeros(self.num_envs, device=self.device)
         for robot, ids in zip(self._robots, self._joint_ids):
@@ -420,19 +488,23 @@ class MicroDuckBallEnv(DirectRLEnv):
             + self.cfg.upright_reward_scale * upright
             - self.cfg.torso_tilt_cost * tilt
             - self.cfg.torso_tumbling_cost * tumbling
+            - root_cost
             - self.cfg.action_rate_cost * rate
             - self.cfg.joint_limit_cost * limits_cost
         ) * self.step_dt
+        return_credit = (
+            self._player_directed_return_event if self.cfg.enable_directed_returns else self._player_return_event
+        )
         strike_reward = (
             self.cfg.hit_reward * self._hit_event
             + self.cfg.aim_reward * self._aim_event
-            + self.cfg.transfer_reward * self._return_event
+            + self.cfg.transfer_reward * return_credit.sum(-1)
         )
         if self.cfg.defer_strike_rewards:
             credit = (
                 self.cfg.hit_reward * (1 - self.cfg.immediate_hit_fraction) * self._player_hit_event
                 + self.cfg.aim_reward * self._player_aim_event
-                + self.cfg.transfer_reward * self._player_return_event
+                + self.cfg.transfer_reward * return_credit
             )
             paid, recovered = self._recovery.step(
                 credit,
@@ -473,6 +545,16 @@ class MicroDuckBallEnv(DirectRLEnv):
                 "Metrics/returns": self._returns[env_ids].mean(),
                 "Metrics/recovered_hits": self._recovered_hits[env_ids].mean(),
                 "Metrics/recovery_reward": self._recovery_reward_sum[env_ids].mean(),
+                "Metrics/min_root_height": self._min_root_height[env_ids].mean(),
+                "Metrics/max_inward_speed": self._max_inward_speed[env_ids].mean(),
+                "Metrics/sustained_low_torso": self._low_torso[env_ids].float().mean(),
+                "Metrics/serve_launch_quality": (
+                    self._serve_quality[env_ids].sum()
+                    / (self._hits[env_ids] - self._returns[env_ids]).sum().clamp_min(1)
+                ),
+                "Metrics/reply_launch_quality": (
+                    self._reply_quality[env_ids].sum() / self._returns[env_ids].sum().clamp_min(1)
+                ),
                 "Metrics/rally_2_returns": (self._returns[env_ids] >= 2).float().mean(),
                 "Metrics/rally_4_returns": (self._returns[env_ids] >= 4).float().mean(),
                 "Metrics/rally_8_returns": (self._returns[env_ids] >= 8).float().mean(),
@@ -493,6 +575,7 @@ class MicroDuckBallEnv(DirectRLEnv):
             }
         super()._reset_idx(env_ids)
         self._recovery.reset(env_ids)
+        self._compression.reset(env_ids)
         self._post_rally.reset(env_ids)
         for i, robot in enumerate(self._robots):
             pose = robot.data.default_root_pose.torch[env_ids].clone()
@@ -514,6 +597,7 @@ class MicroDuckBallEnv(DirectRLEnv):
         self.scene.update(dt=0.0)
         self._server[env_ids] = torch.randint(self.cfg.num_players, (len(env_ids),), device=self.device)
         head_pos = self._head_positions()[env_ids, self._server[env_ids]]
+        self._home_heads[env_ids] = self._head_positions()[env_ids]
         self._target[env_ids] = head_pos
         self._target[env_ids, 0] = 2 * self.scene.env_origins[env_ids, 0] - head_pos[:, 0]
         self._target[env_ids, 1] = self.scene.env_origins[env_ids, 1]
@@ -526,6 +610,10 @@ class MicroDuckBallEnv(DirectRLEnv):
         self._ball.write_root_pose_to_sim_index(root_pose=pose, env_ids=env_ids)
         self._ball.write_root_velocity_to_sim_index(root_velocity=velocity, env_ids=env_ids)
         for buffer in (
+            self._max_inward_speed,
+            self._low_torso,
+            self._serve_quality,
+            self._reply_quality,
             self._post_recovered,
             self._fell_after_miss,
             self._rally_invalid,
@@ -535,6 +623,8 @@ class MicroDuckBallEnv(DirectRLEnv):
             self._player_hit_event,
             self._player_aim_event,
             self._player_return_event,
+            self._player_directed_return_event,
+            self._player_serve_quality_event,
             self._recovered_hits,
             self._recovery_reward_sum,
             self._actions,
@@ -565,5 +655,8 @@ class MicroDuckBallEnv(DirectRLEnv):
         ):
             buffer[env_ids] = 0
         self._last_hitter[env_ids] = -1
+        self._min_root_height[env_ids] = torch.stack(
+            [r.data.root_link_pos_w.torch[env_ids, 2] - self.scene.env_origins[env_ids, 2] for r in self._robots], dim=1
+        ).amin(-1)
         self._since_hit[env_ids] = 0
         self._last_ball_pos[env_ids] = pose[:, :3]

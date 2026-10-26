@@ -275,6 +275,8 @@ def collect(args: argparse.Namespace) -> tuple[list[dict], dict]:
                 "serve_height_m": cfg.serve_height,
                 "serve_down_speed_m_s": cfg.serve_down_speed,
                 "post_rally_duration_s": cfg.post_rally_duration,
+                "enable_root_recovery": cfg.enable_root_recovery,
+                "enable_directed_returns": cfg.enable_directed_returns,
                 "max_steps_reached": env.trace_completed < args.episodes,
             }
         finally:

@@ -243,13 +243,60 @@ crossing and falling; the summary alone does not establish which event caused an
 
 ### Fine-tune recovery on the original scene
 
+The latest volley objective has two independently switchable corrections, based on the
+30-episode trace from `model_40250.pt`. Actor observations/actions and checkpoint tensors
+are unchanged. Both corrections are enabled by default in the pair task, and disabled
+by default in single-player heading:
+
+- `env.enable_root_recovery`: penalize sustained compression below `0.8 * spawn height`
+  after `0.12 s`, except upward motion faster than `0.1 m/s`. The cost is
+  `20 * (0.8 - height / spawn height)**2` per second for the worst player, clamped
+  to zero above the threshold. A brief crouch or low upward takeoff earns no compression
+  cost. It adds no root-height termination and does not freeze joints.
+- The same switch adds a predictive center-buffer cost. Signed inward position is
+  negative in the robot's own half. The cost is
+  `10 * max(0, (position + max(inward_speed, 0) * 0.2 + 0.08) / 0.08)**2` per second
+  for the worst player. Ordinary motion safely inside the half is free; imminent entry
+  into the 8 cm center buffer is discouraged before reaching the hard 3 cm boundary.
+  Recovery payouts require at least `0.85 * spawn height` and planar speed at most
+  `0.2 m/s`, in addition to the existing tilt, angular and vertical-speed checks.
+- `env.enable_directed_returns`: aim at the partner's initial forehead position, leaving
+  observations of the actual partner unchanged. For a descending ballistic crossing
+  with XY miss distance `d`, quality is `q = 1 / (1 + (d / receiver_radius)**2)`.
+  The original upward-speed and flight-time checks still apply. Reply credit becomes
+  `5*q`, rather than `5` for any legal reply, and aiming credit remains `2*q`.
+  The heavy-tailed quality retains more feedback than an exponential for large errors.
+  Immediate contact credit remains `0.2`; all other strike credit still requires recovery.
+  With this switch off, the previous exponential quality/current-head target and fixed
+  reply credit are restored.
+
+Counterfactual scoring of the **same uploaded trajectories**, before recovery cancellation
+and discounting, gives first-strike bonuses `2.14 -> 2.17`, and second-strike bonuses
+`6.01 -> 1.34`. The new root costs average `0.18` per episode for compression and `3.29`
+for center approach. Compression is detected in 29/30 episodes. This validates incentives
+on the observed failure, not improved behavior of a trained policy. The existing `fell`
+metric remains an orientation/safety measure; it does not classify all low postures as falls.
+Use `Metrics/min_root_height`, `max_inward_speed`, `sustained_low_torso`,
+`serve_launch_quality`, and `reply_launch_quality` alongside rally metrics and video.
+Quality averages are weighted by the number of credited initial/reply contacts. Their
+values are not directly comparable across the two quality formulas.
+
+To isolate each correction, start two separate short runs from the same explicit source
+checkpoint. For a root-only run set `env.enable_directed_returns=false`; for a trajectory-only
+run set `env.enable_root_recovery=false`. Do not chain one ablation's weights into the other.
+A run with both enabled changes two mechanisms and is an exploratory combined experiment.
+Both flags false restores the preceding post-rally objective. Keep scene and ball settings
+unchanged, preserve the source checkpoint, use a fresh optimizer and separate experiment names.
+
 The volley task pays only `0.2` immediately for each legal strike. The other `0.8`,
-the aiming bonus (up to `2`), and the return bonus (`5` after the first strike) are
+the aiming bonus (up to `2`), and the return bonus (up to `5` after the first strike) are
 banked for the player who made that strike. They are paid once after at least
 `0.12 s` since that player's latest strike and `0.10 s` of continuous recovery:
 
 - Torso tilt at most 20 degrees, combined roll/pitch speed at most `1.5 rad/s`.
-- Root height from `0.6 * initial height` to `initial height + 0.03 m`.
+- Root height from `0.85 * initial height` to `initial height + 0.03 m` with root recovery
+  enabled (`0.6 * initial height` when disabled), and planar speed at most `0.2 m/s`
+  when enabled.
 - Absolute vertical speed at most `0.25 m/s`.
 
 The height/speed checks are a landing proxy, not a foot-to-floor contact measurement.
@@ -262,8 +309,9 @@ if the robot falls later; the recovery window is finite.
 
 Two legal strikes with no recovery now receive only `0.4` in immediate strike bonuses.
 If followed by a registered fall/collision/robot court exit (`-2`), their sparse subtotal
-is `-1.6`, before dense terms. Two fully recovered strikes still receive `7` to `11`
-in total strike/aim/return bonuses, before discounting. A ball exit alone has no `-2`
+is `-1.6`, before dense terms. With directed returns enabled, two fully recovered strikes
+receive `2 + 2*q_first + 7*q_second` in total strike/aim/reply bonuses, before discounting;
+the previous objective paid `7 + 2*q_first + 2*q_second`. A ball exit alone has no `-2`
 fall cost, but forfeits outstanding credit and incurs the separate miss cost described below.
 This discourages the observed shortcut;
 it does not prove that a learned policy will recover or that every short rally loses reward.
@@ -302,8 +350,8 @@ no valid strike occurred. It is not the completion reward itself.
 mechanically and must not be treated as longer ball rallies. Ball/invalid-contact failure
 metrics retain their original causes across the phase; safety failure metrics can overlap.
 
-Keep the original spacing and serve while testing this objective. Start with a short continuation
-from the latest recovery pair, with a fresh optimizer in a separate experiment. First run
+Keep the original spacing and serve while testing this objective. First isolate root recovery
+with a short continuation from the latest overnight pair, with a fresh optimizer in a separate experiment. Run
 the GPU integration test (its volley case now checks miss-to-recovery-to-fall reset):
 
 ```bash
@@ -311,17 +359,22 @@ uv run --extra test python -m pytest source/isaaclab_tasks/test/test_microduck_b
 ```
 
 ```bash
-CHECKPOINT="$(ls -t logs/rsl_rl/microduck_volley_recovery/*/model_*.pt | head -n 1)"
+CHECKPOINT="$(ls -t logs/rsl_rl/microduck_volley_post_rally_20k/*/model_*.pt | head -n 1)"
 nohup uv run --extra viser isaaclab train \
   --rl_library rsl_rl --task IsaacContrib-Volley-MicroDuck \
-  --experiment_name microduck_volley_post_rally \
-  --num_envs 1024 --max_visible_envs 4 --max_iterations 200 --viz viser \
+  --experiment_name microduck_volley_root_fix \
+  --num_envs 1024 --max_visible_envs 4 --max_iterations 500 --viz viser \
   --checkpoint "$CHECKPOINT" --no-resume_optimizer_state \
   env.separation=0.35 env.serve_height=0.25 env.serve_down_speed=0.2 \
-  > volley_post_rally.log 2>&1 < /dev/null &
+  env.enable_directed_returns=false \
+  > volley_root_fix.log 2>&1 < /dev/null &
 ```
 
-Inspect a checkpoint from `logs/rsl_rl/microduck_volley_post_rally/` explicitly during playback.
+Inspect a checkpoint from `logs/rsl_rl/microduck_volley_root_fix/` explicitly during playback,
+also passing `env.enable_directed_returns=false` to preserve the root-only evaluation config.
+For a separate trajectory-only ablation, keep the same source checkpoint, set
+`env.enable_root_recovery=false env.enable_directed_returns=true`, and use a different
+experiment/log name. Do not assume that a joint default run isolates either mechanism.
 `Metrics/recovered_hits` counts strikes whose banked credit was paid; compare it with
 `Metrics/head_hits`. `Metrics/recovery_reward` is the mean sum of paid banked credit per episode.
 Compare returns, rally counts, episode length, robot exits, center crossings, and falling,

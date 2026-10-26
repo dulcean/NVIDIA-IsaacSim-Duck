@@ -49,6 +49,62 @@ def balance_errors(gravity_b: torch.Tensor, angular_velocity_b: torch.Tensor) ->
     return tilt, tumbling
 
 
+def launch_quality(
+    position: torch.Tensor,
+    velocity: torch.Tensor,
+    target: torch.Tensor,
+    radius: float,
+    min_flight: float,
+    smooth: bool,
+) -> torch.Tensor:
+    """Score the descending ballistic crossing; heavy tails retain feedback for inaccurate replies."""
+    discriminant = velocity[:, 2].square() + 2 * 9.81 * (position[:, 2] - target[:, 2])
+    flight = (velocity[:, 2] + discriminant.clamp_min(0).sqrt()) / 9.81
+    landing = position[:, :2] + velocity[:, :2] * flight.unsqueeze(-1)
+    error = (landing - target[:, :2]).square().sum(-1) / radius**2
+    quality = 1 / (1 + error) if smooth else torch.exp(-error)
+    return quality * ((discriminant > 0) & (velocity[:, 2] > 0.1) & (flight > min_flight))
+
+
+def center_approach_error(
+    inward_position: torch.Tensor, inward_speed: torch.Tensor, buffer: float, lookahead: float
+) -> torch.Tensor:
+    """Anticipate entry into the center buffer, allowing ordinary movement inside the half-court.
+
+    Signed inward positions are negative in the player's own half. Outward
+    velocity does not increase the predicted intrusion; vertical motion is unrestricted.
+    """
+    predicted = inward_position + inward_speed.clamp_min(0) * lookahead
+    return ((predicted + buffer) / buffer).clamp_min(0).square()
+
+
+class SustainedCompression:
+    """Detect sustained low torso height without penalizing a brief crouch or upward takeoff."""
+
+    def __init__(self, num_envs: int, num_players: int, device: str):
+        self.low_time = torch.zeros(num_envs, num_players, device=device)
+
+    def reset(self, env_ids):
+        """Clear crouch history only in reset worlds."""
+        self.low_time[env_ids] = 0
+
+    def step(
+        self,
+        height: torch.Tensor,
+        initial_height: torch.Tensor,
+        vertical_speed: torch.Tensor,
+        dt: float,
+        ratio: float,
+        grace: float,
+        takeoff_speed: float,
+    ) -> torch.Tensor:
+        """Return squared normalized height deficit after a sustained compression interval."""
+        deficit = (ratio - height / initial_height.clamp_min(1e-6)).clamp_min(0)
+        low = (deficit > 0) & (vertical_speed <= takeoff_speed)
+        self.low_time = torch.where(low, self.low_time + dt, 0.0)
+        return deficit.square() * (self.low_time + 1e-6 >= grace)
+
+
 class RecoveryRewards:
     """Bank strike credit per player until sustained recovery; terminal steps cancel unpaid credit."""
 

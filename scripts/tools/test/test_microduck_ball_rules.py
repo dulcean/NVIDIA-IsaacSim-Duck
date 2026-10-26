@@ -8,12 +8,66 @@
 import importlib.util
 from pathlib import Path
 
+import pytest
 import torch
 
 _PATH = Path(__file__).resolve().parents[3] / "source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/ball_rules.py"
 _SPEC = importlib.util.spec_from_file_location("microduck_ball_rules", _PATH)
 rules = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(rules)
+
+
+def test_launch_quality_rewards_targeted_replies_without_a_flat_contact_bonus():
+    """Known 0.2 s arcs miss by 0, 9, 18 or 39 cm; unreachable arcs cannot earn quality credit."""
+    positions = torch.tensor([[0.0, 0.0, 0.3]] * 5)
+    velocity = torch.tensor([[1.75, y, 0.981] for y in (0.0, 0.45, 0.9, 1.95, 0.0)])
+    positions[4, 2] = 0.1
+    velocity[4, 2] = 0.2
+    targets = torch.tensor([[0.35, 0.0, 0.3]] * 5)
+    quality = rules.launch_quality(positions, velocity, targets, 0.09, 0.08, smooth=True)
+    torch.testing.assert_close(quality, torch.tensor([1.0, 0.5, 0.2, 1 / (1 + (0.39 / 0.09) ** 2), 0.0]))
+    # The transfer component pays all five points only for an accurately directed reply.
+    assert (5 * quality[0]).item() == pytest.approx(5)
+    assert (5 * quality[3]).item() < 0.26
+    legacy = rules.launch_quality(positions, velocity, targets, 0.09, 0.08, smooth=False)
+    assert legacy[1].item() == pytest.approx(0.36787944, abs=1e-6)
+    assert 0 < legacy[3] < quality[3]  # Heavy tails keep a learning signal for the observed large error.
+
+
+def test_center_buffer_anticipates_inward_motion_without_penalizing_a_safe_step():
+    """Walking safely or moving away from center is allowed; an imminent center crossing has a cost."""
+    position = torch.tensor([[-0.175, -0.13, -0.12, -0.12]])
+    speed = torch.tensor([[0.0, 0.1, 0.4, -0.4]])
+    error = rules.center_approach_error(position, speed, buffer=0.08, lookahead=0.2)
+    torch.testing.assert_close(error, torch.tensor([[0.0, 0.0, 0.25, 0.0]]))
+
+
+def test_compression_ignores_brief_crouch_and_takeoff_but_detects_sustained_sag():
+    """A jump preparation and takeoff remain free; the recorded collapsed-height pattern is penalized."""
+    state = rules.SustainedCompression(1, 2, "cpu")
+    height = torch.tensor([[0.05, 0.05]])
+    initial = torch.full_like(height, 0.125)
+    vertical = torch.zeros_like(height)
+    for _ in range(5):
+        cost = state.step(height, initial, vertical, 0.02, 0.8, 0.12, 0.1)
+        assert not cost.any()
+    vertical[0, 0] = 0.2  # Takeoff resets the low-height dwell time instead of punishing a low jump.
+    cost = state.step(height, initial, vertical, 0.02, 0.8, 0.12, 0.1)
+    torch.testing.assert_close(cost, torch.tensor([[0.0, 0.16]]))
+    height[:] = 0.11  # Normal supported posture is below spawn height but above the compression threshold.
+    assert not state.step(height, initial, vertical, 0.02, 0.8, 0.12, 0.1).any()
+
+
+def test_compression_subset_reset_cannot_carry_a_previous_collapse_into_a_new_episode():
+    state = rules.SustainedCompression(2, 1, "cpu")
+    height = torch.full((2, 1), 0.05)
+    initial = torch.full_like(height, 0.125)
+    vertical = torch.zeros_like(height)
+    for _ in range(5):
+        state.step(height, initial, vertical, 0.02, 0.8, 0.12, 0.1)
+    state.reset(torch.tensor([0]))
+    cost = state.step(height, initial, vertical, 0.02, 0.8, 0.12, 0.1)
+    torch.testing.assert_close(cost, torch.tensor([[0.0], [0.16]]))
 
 
 def test_alternating_onset_accepts_reply_without_flight_time_gate():
@@ -76,8 +130,8 @@ def test_balance_detects_either_partner_tumbling_but_allows_yaw():
     torch.testing.assert_close(tumbling, torch.tensor([0.0, 9.0, 4.0]))
 
 
-def test_recovery_conserves_strike_credit_and_pays_only_once():
-    """Two recovered strikes retain the original seven-point budget, including immediate credit."""
+def test_recovery_conserves_banked_credit_and_pays_only_once():
+    """The supplied banked credit is released exactly once, without changing its amount."""
     state = rules.RecoveryRewards(1, 2, "cpu")
     credit = torch.tensor([[0.8, 5.8]])
     hits = torch.ones_like(credit)

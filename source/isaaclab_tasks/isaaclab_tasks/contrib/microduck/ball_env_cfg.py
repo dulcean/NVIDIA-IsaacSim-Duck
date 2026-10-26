@@ -159,6 +159,17 @@ class MicroDuckHeadingEnvCfg(DirectRLEnvCfg):
     post_rally_hold: float = 0.2
     post_rally_reward: float = 0.5
     miss_cost: float = 0.5
+    enable_root_recovery: bool = False
+    enable_directed_returns: bool = False
+    compression_cost: float = 20.0
+    compression_height_ratio: float = 0.8
+    compression_grace: float = 0.12
+    compression_takeoff_speed: float = 0.1
+    recovered_height_ratio: float = 0.85
+    recovered_max_planar_speed: float = 0.2
+    center_approach_cost: float = 10.0
+    center_buffer: float = 0.08
+    center_lookahead: float = 0.2
 
     def __post_init__(self):
         self.sim.physics_material = self.scene.terrain.physics_material
@@ -177,3 +188,5 @@ class MicroDuckVolleyEnvCfg(MicroDuckHeadingEnvCfg):
     torso_tumbling_cost = 0.05
     defer_strike_rewards = True
     post_rally_duration = 0.6
+    enable_root_recovery = True
+    enable_directed_returns = True
