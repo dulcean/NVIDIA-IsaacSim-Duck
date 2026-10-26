@@ -61,8 +61,13 @@ def test_microduck_real_head_rgb_tracking_motion_and_partial_reset(device):
         for camera, consumed_frame in zip(env.head_cameras, env._last_camera_frames):
             torch.testing.assert_close(consumed_frame, camera.frame.torch.long())
         actions = torch.zeros(2, 28, device=device)
+        initial_frames = [camera.frame.torch.clone() for camera in env.head_cameras]
         for _ in range(8):
             _assert_finite_step(env, actions)
+        # 160 ms of physics contains four scheduled 35 ms exposures. No eager
+        # render or UI read may trigger captures between those global boundaries.
+        for camera, initial_frame in zip(env.head_cameras, initial_frames):
+            torch.testing.assert_close(camera.frame.torch - initial_frame, torch.full_like(initial_frame, 4))
 
         # Both real head sensors must produce nonconstant RGB, not a guide
         # marker, a backwards view of the lens, or the external Viser camera.

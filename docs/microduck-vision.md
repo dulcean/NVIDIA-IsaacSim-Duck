@@ -38,13 +38,16 @@ On the NVIDIA host, after pulling:
 ```bash
 uv run --extra viser python scripts/tools/view_microduck_vision.py \
   --checkpoint logs/rsl_rl/microduck_volley_curriculum/2026-10-26_13-12-26-462912/model_1400.pt \
-  --num-envs 4 --steps 300 --viz viser
+  --num-envs 4 --steps 1500 --viz viser
 ```
 
 The existing Viser server on port 8080 keeps its 3D scene and adds a **Head cameras**
 folder with both images and a world selector. Only the selected images transfer to the
-CPU, at up to ten wall-clock updates per second. Rendering and tracking continue without
+CPU, at up to 30 wall-clock updates per second. Rendering and tracking continue without
 browser clients. Omit the `viser` extra and set `--viz none` for headless inspection.
+Preview is paced to physical time by default; `--no-real-time` runs without pacing.
+`--no-head-panels` keeps the 3D scene while excluding the image panels. `--panel-fps`
+sets their presentation ceiling; it does not change sensor or policy timing.
 
 `logs/microduck_vision_preview/` receives the first/last valid RGB snapshots and
 `preview.json`: fresh-frame counts, accepted pixel measurements, track ages and measured
@@ -79,8 +82,8 @@ can be ambiguous; different balls, lighting and materials need detector validati
 
 Measurements transform through the captured camera pose into world coordinates before
 velocity estimation, compensating head motion. Camera timing is independent of the 50 Hz
-policy. The requested 1/30 s capture period quantizes to physics steps (normally 35 ms
-with 5 ms eager sensor updates); tracking uses the actual fresh-frame interval. Re-reading
+policy. The requested 1/30 s capture period quantizes to the global physics clock (normally
+35 ms with 5 ms physics steps); tracking uses the actual fresh-frame interval. Re-reading
 a cached frame does not produce another measurement. After a missed frame, a bounded
 ballistic prediction lasts at most 0.15 s; expiry returns zero ball features and an invalid
 age flag. Partial resets clear only the selected tracks and discard captures from the
@@ -138,3 +141,40 @@ dropouts, actor truth isolation and real RSL-RL checkpoint conversion. GPU rende
 learning are not established by these CPU tests. This partial development checkout also
 lacks the generated environment-browser assets under `docs/source`; the registry updater
 cannot run here without the simulation/Gym dependency environment.
+
+## Preview performance
+
+Capture uses a global clock independent of each world's episode reset: at the default
+settings both cameras capture every seven physics ticks (35 ms). Scene sensor updates
+are lazy; contact data is still read every 5 ms. The renderer therefore receives synchronized
+worlds rather than rendering its entire camera batch whenever any independently reset
+world happens to be due. The UI and artifact saver read the last captured buffers without
+requesting new renders. Tracking predictions still advance at physics resolution.
+
+The tracker batches candidate geometry, reuses pixel grids and avoids copying snapshots
+on each physics tick. Detection uses orange color ratios with a lower brightness floor;
+this preserves the shaded brown portion of the real rendered sphere instead of measuring
+only its bright cap. Uploaded RGB frames provide a regression test for that failure.
+
+The report's `timing` separates setup/compilation, the first ten warmup steps, playback,
+policy calls, environment steps, diagnostics, artifacts and pacing waits. Rates exclude
+setup and warmup. `control_steps_per_second` measures policy steps, and `real_time_factor`
+measures simulated seconds per wall second; neither is a browser FPS measurement.
+`diagnostics.panels` measures the head panels only. These are host wall timings, not a
+CUDA kernel profile. Interrupted previews retain completed-step counts and the last valid
+snapshots. GPU throughput still needs measurement on the target hardware.
+
+For a short unpaced measurement with the same checkpoint and four worlds:
+
+```bash
+uv run --extra viser python scripts/tools/view_microduck_vision.py \
+  --checkpoint logs/rsl_rl/microduck_volley_curriculum/2026-10-26_13-12-26-462912/model_1400.pt \
+  --num-envs 4 --steps 210 --viz viser --no-real-time \
+  --output logs/microduck_vision_performance
+```
+
+Keep the browser connected during that measurement. Comparing `--viz none` with Viser,
+or `--no-head-panels` with the full UI, isolates presentation overhead without learning.
+Camera scheduling is part of sensor contract version 2; a full visual resume carrying
+the older contract is rejected. Ordinary curriculum/legacy weights remain valid inputs
+to the preview's in-memory visual adapter.

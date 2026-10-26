@@ -26,6 +26,7 @@ class MicroDuckVolleyVisionEnvCfg(MicroDuckVolleyCurriculumEnvCfg):
 
     observation_space = 146
     state_space = 142
-    scene = MicroDuckVolleyVisionSceneCfg(num_envs=32, env_spacing=2.0, lazy_sensor_update=False)
+    scene = MicroDuckVolleyVisionSceneCfg(num_envs=32, env_spacing=2.0, lazy_sensor_update=True)
     vision_max_age: float = 0.15
     head_camera_panels: bool = True
+    head_camera_panel_fps: float = 30.0

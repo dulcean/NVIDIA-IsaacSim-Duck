@@ -134,6 +134,8 @@ class BallVisualTracker:
         self.confidence = torch.zeros_like(self.age)
         self._last_measurement = torch.zeros_like(self.position_w)
         self._measurement_confidence = torch.zeros_like(self.age)
+        self._acceleration = self.position_w.new_tensor((0.0, 0.0, -9.81))
+        self._pixel_cache = {}
 
     def reset(self, env_ids=None):
         """Clear selected tracks without carrying old pixels or velocity across an episode reset."""
@@ -174,89 +176,92 @@ class BallVisualTracker:
 
     def _measure(self, rgb, intrinsics, camera_position_w, camera_quat_xyzw, prediction, prior):
         height, width = rgb.shape[1:3]
+        key = (height, width)
+        if key not in self._pixel_cache:
+            yy, xx = torch.meshgrid(
+                torch.arange(height, device=self.device, dtype=torch.float32),
+                torch.arange(width, device=self.device, dtype=torch.float32),
+                indexing="ij",
+            )
+            template = torch.arange(1, height * width + 1, device=self.device, dtype=torch.float32)
+            counts = torch.zeros(self.num_envs, height * width + 1, device=self.device)
+            self._pixel_cache[key] = (template.view(1, height, width), yy, xx, counts)
+        template, yy, xx, counts = self._pixel_cache[key]
         pixels = rgb.to(torch.float32)
         red, green, blue = pixels.unbind(-1)
-        # Yellow bodies have green/red near one; orange beaks are further checked by blob geometry/borders.
-        mask = (red >= 140) & (green >= 45) & (green <= 195) & (blue <= 110)
-        mask &= (red >= 1.30 * green) & (green >= 1.5 * blue + 10)
-        labels = torch.arange(1, height * width + 1, device=self.device, dtype=torch.float32)
-        labels = labels.view(1, height, width).expand(self.num_envs, -1, -1) * mask
-        # Neighbor propagation plus parent-pointer compression handles compact blobs without CPU image copies.
+        # Ratios retain the shaded hemisphere seen in actual Newton camera frames.
+        # Absolute brightness alone removed half the ball and corrupted monocular size/range.
+        mask = (red >= 45) & (green >= 15) & (red - green >= 15)
+        mask &= (red >= 1.30 * green) & (green >= 1.5 * blue + 4)
+        labels = template.expand(self.num_envs, -1, -1) * mask
         for _ in range(math.ceil(math.log2(height * width)) + 2):
             labels = F.max_pool2d(labels.unsqueeze(1), 3, stride=1, padding=1).squeeze(1) * mask
             parents = labels.flatten(1)
             labels = parents.gather(1, (parents.long() - 1).clamp_min(0)).view_as(labels) * mask
-        counts = torch.zeros(self.num_envs, height * width + 1, device=self.device)
+        counts.zero_()
         counts.scatter_add_(1, labels.flatten(1).long(), mask.flatten(1).float())
         candidates = counts.topk(min(self.max_candidates, height * width), dim=1).indices
-        yy, xx = torch.meshgrid(
-            torch.arange(height, device=self.device, dtype=torch.float32),
-            torch.arange(width, device=self.device, dtype=torch.float32),
-            indexing="ij",
-        )
+        # All candidates share one geometry/undistortion pass. This preserves the
+        # component rules while avoiding four copies of small GPU kernel launches.
+        selected = (labels[:, None] == candidates[:, :, None, None]) & mask[:, None]
+        area = selected.sum(dim=(-1, -2)).float()
+        safe_area = area.clamp_min(1)
+        u = (selected * xx).sum(dim=(-1, -2)) / safe_area
+        v = (selected * yy).sum(dim=(-1, -2)) / safe_area
+        var_x = (selected * (xx - u[:, :, None, None]).square()).sum(dim=(-1, -2)) / safe_area
+        var_y = (selected * (yy - v[:, :, None, None]).square()).sum(dim=(-1, -2)) / safe_area
+        low_x = torch.where(selected, xx, float(width)).amin(dim=(-1, -2))
+        high_x = torch.where(selected, xx, -1.0).amax(dim=(-1, -2))
+        low_y = torch.where(selected, yy, float(height)).amin(dim=(-1, -2))
+        high_y = torch.where(selected, yy, -1.0).amax(dim=(-1, -2))
+        box_width, box_height = high_x - low_x + 1, high_y - low_y + 1
+        fill = area / (box_width * box_height).clamp_min(1)
+        aspect = box_width / box_height.clamp_min(1)
+        radius = torch.sqrt(area / math.pi)
+        moment_error = ((var_x + var_y) * (2 * math.pi) / safe_area - 1).abs()
+        good = (radius >= self.min_radius_px) & (radius <= min(height, width) * self.max_radius_fraction)
+        good &= (low_x >= 1) & (low_y >= 1) & (high_x < width - 1) & (high_y < height - 1)
+        good &= (aspect >= 0.65) & (aspect <= 1.55) & (fill >= 0.60) & (fill <= 0.94)
         intrinsics = intrinsics.float()
         pose_finite = torch.isfinite(camera_position_w).all(-1) & torch.isfinite(camera_quat_xyzw).all(-1)
         pose_finite &= camera_quat_xyzw.norm(dim=-1) > 1e-6
         calibration = torch.isfinite(intrinsics).all(dim=(-1, -2))
         calibration &= (intrinsics[:, 0, 0] > 0) & (intrinsics[:, 1, 1] > 0)
         calibration &= (intrinsics[:, 0, 1].abs() < 1e-6) & (intrinsics[:, 1, 0].abs() < 1e-6)
+        good &= (moment_error < 0.30) & pose_finite[:, None] & calibration[:, None]
+        radius_x, radius_y = 2 * var_x.sqrt(), 2 * var_y.sqrt()
+        endpoint_u = torch.stack((u, u - radius_x, u + radius_x, u, u), dim=-1)
+        endpoint_v = torch.stack((v, v, v, v - radius_y, v + radius_y), dim=-1)
+        points = torch.stack(
+            (
+                (endpoint_u - intrinsics[:, None, None, 0, 2]) / intrinsics[:, None, None, 0, 0].clamp_min(1e-6),
+                (endpoint_v - intrinsics[:, None, None, 1, 2]) / intrinsics[:, None, None, 1, 1].clamp_min(1e-6),
+            ),
+            dim=-1,
+        )
+        undistorted, converged = self._undistort(points)
+        rays = F.normalize(torch.cat((undistorted, torch.ones_like(undistorted[..., :1])), dim=-1), dim=-1)
+        angle_x = torch.acos((rays[:, :, 1] * rays[:, :, 2]).sum(-1).clamp(-1, 1))
+        angle_y = torch.acos((rays[:, :, 3] * rays[:, :, 4]).sum(-1).clamp(-1, 1))
+        angular_radius = (angle_x + angle_y) / 4
+        distance = self.ball_radius / angular_radius.sin().clamp_min(1e-6)
+        camera_point = rays[:, :, 0] * distance.unsqueeze(-1)
         quaternion = F.normalize(torch.nan_to_num(camera_quat_xyzw.float()), dim=-1)
-        positions, scores = [], []
-        for component in candidates.unbind(1):
-            selected = (labels == component[:, None, None]) & mask
-            area = selected.sum(dim=(-1, -2)).float()
-            safe_area = area.clamp_min(1)
-            u = (selected * xx).sum(dim=(-1, -2)) / safe_area
-            v = (selected * yy).sum(dim=(-1, -2)) / safe_area
-            var_x = (selected * (xx - u[:, None, None]).square()).sum(dim=(-1, -2)) / safe_area
-            var_y = (selected * (yy - v[:, None, None]).square()).sum(dim=(-1, -2)) / safe_area
-            low_x = torch.where(selected, xx, float(width)).amin(dim=(-1, -2))
-            high_x = torch.where(selected, xx, -1.0).amax(dim=(-1, -2))
-            low_y = torch.where(selected, yy, float(height)).amin(dim=(-1, -2))
-            high_y = torch.where(selected, yy, -1.0).amax(dim=(-1, -2))
-            box_width, box_height = high_x - low_x + 1, high_y - low_y + 1
-            fill = area / (box_width * box_height).clamp_min(1)
-            aspect = box_width / box_height.clamp_min(1)
-            radius = torch.sqrt(area / math.pi)
-            moment_error = ((var_x + var_y) * (2 * math.pi) / safe_area - 1).abs()
-            good = (radius >= self.min_radius_px) & (radius <= min(height, width) * self.max_radius_fraction)
-            good &= (low_x >= 1) & (low_y >= 1) & (high_x < width - 1) & (high_y < height - 1)
-            good &= (aspect >= 0.65) & (aspect <= 1.55) & (fill >= 0.60) & (fill <= 0.94)
-            good &= (moment_error < 0.30) & pose_finite & calibration
-            radius_x, radius_y = 2 * var_x.sqrt(), 2 * var_y.sqrt()
-            endpoint_u = torch.stack((u, u - radius_x, u + radius_x, u, u), dim=1)
-            endpoint_v = torch.stack((v, v, v, v - radius_y, v + radius_y), dim=1)
-            points = torch.stack(
-                (
-                    (endpoint_u - intrinsics[:, None, 0, 2]) / intrinsics[:, None, 0, 0].clamp_min(1e-6),
-                    (endpoint_v - intrinsics[:, None, 1, 2]) / intrinsics[:, None, 1, 1].clamp_min(1e-6),
-                ),
-                dim=-1,
-            )
-            undistorted, converged = self._undistort(points)
-            rays = F.normalize(torch.cat((undistorted, torch.ones_like(undistorted[..., :1])), dim=-1), dim=-1)
-            angle_x = torch.acos((rays[:, 1] * rays[:, 2]).sum(-1).clamp(-1, 1))
-            angle_y = torch.acos((rays[:, 3] * rays[:, 4]).sum(-1).clamp(-1, 1))
-            angular_radius = (angle_x + angle_y) / 4
-            distance = self.ball_radius / angular_radius.sin().clamp_min(1e-6)
-            camera_point = rays[:, 0] * distance.unsqueeze(-1)
-            q_vector, q_scalar = quaternion[:, :3], quaternion[:, 3:4]
-            first = 2 * torch.cross(q_vector, camera_point, dim=-1)
-            world_point = camera_point + q_scalar * first + torch.cross(q_vector, first, dim=-1)
-            world_point += camera_position_w
-            good &= converged.all(-1) & torch.isfinite(world_point).all(-1)
-            good &= (distance >= self.min_range) & (distance <= self.max_range)
-            score = (1 - (fill - math.pi / 4).abs() / 0.25).clamp_min(0)
-            score *= (1 - moment_error / 0.30).clamp_min(0)
-            # World-frame association prevents camera motion from masquerading as ball motion.
-            error = (world_point - prediction).norm(dim=-1)
-            gate = self.max_speed * (self.age + self._dt) + 0.08
-            good &= ~prior | (error <= gate)
-            score *= torch.where(prior, torch.exp(-error.square() / gate.square().clamp_min(1e-6)), 1.0)
-            positions.append(torch.nan_to_num(world_point))
-            scores.append(torch.where(good, score, 0.0))
-        scores = torch.stack(scores, dim=1)
-        positions = torch.stack(positions, dim=1)
+        q_vector = quaternion[:, None, :3].expand_as(camera_point)
+        q_scalar = quaternion[:, None, 3:4]
+        first = 2 * torch.cross(q_vector, camera_point, dim=-1)
+        world_point = camera_point + q_scalar * first + torch.cross(q_vector, first, dim=-1)
+        world_point += camera_position_w[:, None]
+        good &= converged.all(-1) & torch.isfinite(world_point).all(-1)
+        good &= (distance >= self.min_range) & (distance <= self.max_range)
+        score = (1 - (fill - math.pi / 4).abs() / 0.25).clamp_min(0)
+        score *= (1 - moment_error / 0.30).clamp_min(0)
+        error = (world_point - prediction[:, None]).norm(dim=-1)
+        gate = (self.max_speed * (self.age + self._dt) + 0.08)[:, None]
+        good &= ~prior[:, None] | (error <= gate)
+        score *= torch.where(prior[:, None], torch.exp(-error.square() / gate.square().clamp_min(1e-6)), 1.0)
+        scores = torch.where(good, score, 0.0)
+        positions = torch.nan_to_num(world_point)
         best_score, best = scores.max(dim=1)
         if scores.shape[1] > 1:
             second = scores.topk(2, dim=1).values[:, 1]
@@ -281,7 +286,7 @@ class BallVisualTracker:
         if not math.isfinite(dt) or dt <= 0:
             raise ValueError("Tracking needs a finite positive elapsed time.")
         self._dt = dt
-        acceleration = self.position_w.new_tensor((0.0, 0.0, -9.81))
+        acceleration = self._acceleration
         elapsed = self.age + dt
         prior = self.valid & (elapsed <= self.max_age + 1e-6)
         prediction = self.position_w + self.velocity_w * dt + 0.5 * acceleration * dt**2
@@ -294,7 +299,14 @@ class BallVisualTracker:
         state = self._prediction(dt)
         return self._commit(torch.zeros_like(self.position_w), self.confidence * 0, self.visible & False, state)
 
-    def _commit(self, measurement, confidence, accepted, state):
+    def advance(self, dt: float):
+        """Advance without allocating a snapshot; use ``tracks`` when policy observations are read."""
+        state = self._prediction(dt)
+        self._commit(
+            torch.zeros_like(self.position_w), self.confidence * 0, self.visible & False, state, snapshot=False
+        )
+
+    def _commit(self, measurement, confidence, accepted, state, snapshot=True):
         acceleration, elapsed, prior, prediction, predicted_velocity = state
         measured_velocity = (measurement - self._last_measurement) / elapsed.clamp_min(1e-6).unsqueeze(-1)
         measured_velocity += 0.5 * acceleration * elapsed.unsqueeze(-1)
@@ -319,16 +331,24 @@ class BallVisualTracker:
         self.age = torch.where(self.valid, self.age, 0.0)
         self._last_measurement.masked_fill_(~self.valid.unsqueeze(-1), 0.0)
         self._measurement_confidence.masked_fill_(~self.valid, 0.0)
-        return self.tracks
+        return self.tracks if snapshot else None
 
     def update(
-        self, rgb, intrinsics, camera_position_w, camera_quat_xyzw, dt: float = 0.02, measurement_mask=None
-    ) -> VisualBallTracks:
+        self,
+        rgb,
+        intrinsics,
+        camera_position_w,
+        camera_quat_xyzw,
+        dt: float = 0.02,
+        measurement_mask=None,
+        snapshot: bool = True,
+    ) -> VisualBallTracks | None:
         """Accept one fresh RGB frame and its synchronized calibration/world pose.
 
         The caller must guard camera frame IDs: repeatedly passing the same
         frame is not a new measurement. Nonfinite calibration/poses reject
-        measurements and use the ordinary short dropout path.
+        measurements and use the ordinary short dropout path. Set ``snapshot``
+        false in a physics tick loop, then read ``tracks`` once at the policy cadence.
         """
         if not math.isfinite(dt) or dt <= 0:
             raise ValueError("A fresh frame needs a finite positive elapsed time.")
@@ -357,4 +377,4 @@ class BallVisualTracker:
         )
         if measurement_mask is not None:
             accepted &= measurement_mask
-        return self._commit(measurement, confidence, accepted, state)
+        return self._commit(measurement, confidence, accepted, state, snapshot=snapshot)
