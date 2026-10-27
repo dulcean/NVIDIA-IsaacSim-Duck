@@ -295,8 +295,45 @@ records. It samples outgoing flight only after separation and the configured
 use the real virtual target, not the parked coach's head. The summary separates
 wrong-direction, non-upward and unreachable-height launches and compares old
 versus corrected timing gates. Predictions do not count as measured successes.
-CPU tests cover the analytic diagnostic boundaries; the new trace command
-still requires execution on the NVIDIA host.
+CPU tests cover the analytic diagnostic boundaries; actual contact comparisons
+require execution on the NVIDIA host.
+
+The first held-out trace of `stage_2_best.pt` (iteration 14000) completed 16
+episodes: one success, 15 candidate legal strikes and no unsafe episodes. The
+median predicted target miss after separation was 44 cm, against a 6.5 cm goal
+radius. The old and corrected flight-clock gates agreed on every sampled
+strike, so that clock fix does not explain this cohort's poor accuracy.
+Eight of the 15 strikes increased the ball's translational mechanical energy
+(including gravity). In the largest case speed rose from 2.92 to 6.53 m/s;
+nearby strike-point motion was about 0.2--0.3 m/s. These observations warrant
+a contact-model check before further training. They do not prove passive
+energy creation: the articulated head can perform work, and neither ball spin
+nor actuator work was recorded. A passing floor-drop test alone does not
+validate the head collision.
+
+For a single-variable comparison, use the same checkpoint, seed and episode
+count, overriding only the ball's authored MuJoCo damping ratio:
+
+```bash
+uv run python scripts/tools/trace_microduck_vision.py \
+  --checkpoint logs/rsl_rl/microduck_volley_vision/2026-10-27_13-52-42-834914/stage_2_best.pt \
+  --stage 2 --episodes-per-side 8 --seed 1000042 \
+  --ball-damping-ratio 0.5 \
+  --output logs/microduck_aim_damping_050.json
+```
+
+This is a diagnostic intervention, not a new training default or a certificate
+of task success. The original authored `solref` is `(0.02, 0.15)`; the candidate
+is `(0.02, 0.5)`. Damping ratio is not restitution. The parameter convention
+is documented in the [MuJoCo solver-parameter reference](https://mujoco.readthedocs.io/en/3.8.0/modeling.html#solver-parameters).
+The report labels this intervention, records the authored parameters and seed,
+and reports incoming/outgoing speeds and translational energy changes without
+classifying a powered strike as a passive bounce. New CSV traces also include
+head-origin linear/angular velocities, so surface velocity can be evaluated at
+the contact point rather than inferred from head-center motion alone. Check
+that extreme speed gains disappear without eliminating useful upward returns;
+do not choose damping from target success on 16 episodes alone. No weights,
+optimizer state, task defaults, joint controls or camera settings are modified.
 
 ## Preview performance
 

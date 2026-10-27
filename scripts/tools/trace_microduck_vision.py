@@ -15,6 +15,28 @@ from collections import Counter
 from pathlib import Path
 
 
+def impact_energy_diagnostics(before, after):
+    """Measure ball translational energy, including height; this is not a passive-impact test.
+
+    A moving robot can supply energy. Spin, stored contact energy and actuator
+    work are not measured here, so an increase alone cannot certify a solver bug.
+    Quantities per unit mass avoid assuming an unmeasured effective contact mass.
+    """
+    states = [[sample[f"ball_v_{axis}"] for axis in "xyz"] + [sample["ball_z"]] for sample in (before, after)]
+    if not all(math.isfinite(value) for state in states for value in state):
+        return None
+    incoming_squared, outgoing_squared = [sum(value**2 for value in state[:3]) for state in states]
+    return {
+        "incoming_speed_m_s": math.sqrt(incoming_squared),
+        "outgoing_speed_m_s": math.sqrt(outgoing_squared),
+        "speed_ratio": math.sqrt(outgoing_squared / incoming_squared) if incoming_squared > 1e-12 else None,
+        "translational_energy_change_j_per_kg": (
+            0.5 * (outgoing_squared - incoming_squared) + 9.81 * (states[1][3] - states[0][3])
+        ),
+        "scope": "Ball translation plus gravity only; robot work and ball spin are unmeasured.",
+    }
+
+
 def flight_diagnostics(row, player, *, minimum_flight=0.16, elapsed_since_hit=0.0):
     """Predict a free descending target-plane crossing from a post-impact sample.
 
@@ -63,6 +85,9 @@ def summarize_flights(rows, records, *, release_delay=0.02, minimum_flight=0.16)
             if hit["event"] != "physics" or len(candidates) != 1:
                 continue
             player = candidates[0]
+            before = samples[index - 1] if index > 0 else None
+            if before is not None and (before["event"] != "physics" or before[f"contact_{player}"]):
+                before = None
             separated = None
             for after in samples[index + 1 :]:
                 if after["event"] == "terminal" or after["raw_head_onsets"]:
@@ -77,6 +102,9 @@ def summarize_flights(rows, records, *, release_delay=0.02, minimum_flight=0.16)
                     "player": player,
                     "hit_time_s": hit["time_s"],
                     "sample_delay_s": None if separated is None else separated["time_s"] - hit["time_s"],
+                    "impact_energy": None
+                    if before is None or separated is None
+                    else impact_energy_diagnostics(before, separated),
                     "flight": None
                     if separated is None
                     else flight_diagnostics(
@@ -104,6 +132,10 @@ def summarize_flights(rows, records, *, release_delay=0.02, minimum_flight=0.16)
             "non_upward": sum(flight["velocity_m_s"][2] <= 0.1 for flight in valid),
             "cannot_reach_target_height": sum(not flight["reachable_plane"] for flight in valid),
             "mean_predicted_miss_m": sum(misses) / len(misses) if misses else None,
+            "max_outgoing_speed_m_s": max(
+                (entry["impact_energy"]["outgoing_speed_m_s"] for entry in selected if entry["impact_energy"]),
+                default=None,
+            ),
         }
     return {
         "episodes": len(records),
@@ -156,6 +188,11 @@ def collect(args):
     cfg.head_camera_panels = False
     cfg.curriculum_stage = args.stage
     cfg.seed = args.seed
+    collision = cfg.scene.ball.spawn.collision_props[1]
+    if args.ball_damping_ratio is not None:
+        # A diagnostic intervention only. Never silently change the training task
+        # or treat success under a different contact model as a qualification pass.
+        collision.solref = (collision.solref[0], args.ball_damping_ratio)
     rows, records = [], []
 
     class TracedVision(MicroDuckVolleyVisionEnv):
@@ -185,6 +222,14 @@ def collect(args):
                 quaternion = self._robots[player].data.body_link_quat_w.torch[:, self._head_ids[player]]
                 for index, axis in enumerate("xyzw"):
                     fields[f"head_quat_{side}_{axis}"] = quaternion[:, index]
+                data, body = self._robots[player].data, self._head_ids[player]
+                for prefix, tensor in (
+                    ("head_origin", data.body_link_pos_w.torch[:, body] - self.scene.env_origins),
+                    ("head_linear_velocity", data.body_link_lin_vel_w.torch[:, body]),
+                    ("head_angular_velocity", data.body_link_ang_vel_w.torch[:, body]),
+                ):
+                    for index, axis in enumerate("xyz"):
+                        fields[f"{prefix}_{side}_{axis}"] = tensor[:, index]
                 sensor = self._sensors[player].data
                 points = sensor.contact_pos_w.torch[:, self._head_masks[player], 0].squeeze(1)
                 points = points - self.scene.env_origins
@@ -275,6 +320,9 @@ def collect(args):
                     "release_delay_s": cfg.release_delay,
                     "minimum_flight_s": cfg.minimum_flight_time,
                     "target_radius_m": cfg.target_radius,
+                    "seed": args.seed,
+                    "authored_ball_solref": list(collision.solref),
+                    "contact_experiment": args.ball_damping_ratio is not None,
                     "training_performed": False,
                 },
             )
@@ -290,10 +338,17 @@ def main():
     parser.add_argument("--max-steps", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=1000042)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--ball-damping-ratio",
+        type=float,
+        help="Diagnostic-only solref damping override; saved weights remain unchanged.",
+    )
     parser.add_argument("--output", type=Path, default=Path("logs/microduck_aim_trace.json"))
     args = parser.parse_args()
     if not args.checkpoint.is_file() or min(args.episodes_per_side, args.max_steps) < 1 or args.seed < 1000000:
         parser.error("Supply visual weights, positive episode/step counts and a held-out seed >=1000000.")
+    if args.ball_damping_ratio is not None and not 0 < args.ball_damping_ratio <= 1:
+        parser.error("Use 0 < --ball-damping-ratio <= 1 for the diagnostic contact comparison.")
     rows, records, metadata = collect(args)
     report = summarize_flights(
         rows, records, release_delay=metadata["release_delay_s"], minimum_flight=metadata["minimum_flight_s"]

@@ -7,7 +7,7 @@
 
 import pytest
 
-from scripts.tools.trace_microduck_vision import flight_diagnostics, summarize_flights
+from scripts.tools.trace_microduck_vision import flight_diagnostics, impact_energy_diagnostics, summarize_flights
 
 
 def row(time, *, world=0, episode=1, event="physics", hit=False, contact=False):
@@ -82,3 +82,19 @@ def test_visual_flight_distinguishes_wrong_direction_unreachable_and_elapsed_hor
     short.update(ball_x=0.035, ball_z=0.314715, ball_v_z=0.63765, ball_v_x=0.3 / 0.17)
     result = flight_diagnostics(short, "a", elapsed_since_hit=0.02)
     assert result["quality_gate"] and not result["legacy_quality_gate"]
+
+
+def test_impact_energy_distinguishes_gravity_from_energy_added_during_a_strike():
+    """Speed gain downhill is not energy creation; equal-height speed doubling adds 13.5 J/kg."""
+    before = row(0)
+    before.update(ball_z=2.0, ball_v_x=0.0, ball_v_y=0.0, ball_v_z=0.0)
+    fallen = row(1)
+    fallen.update(ball_z=1.0, ball_v_x=0.0, ball_v_y=0.0, ball_v_z=-(19.62**0.5))
+    assert impact_energy_diagnostics(before, fallen)["translational_energy_change_j_per_kg"] == pytest.approx(0)
+    before.update(ball_v_x=3.0)
+    outgoing = dict(before, ball_v_x=6.0)
+    diagnostic = impact_energy_diagnostics(before, outgoing)
+    assert diagnostic["speed_ratio"] == pytest.approx(2)
+    assert diagnostic["translational_energy_change_j_per_kg"] == pytest.approx(13.5)
+    outgoing["ball_v_x"] = float("nan")
+    assert impact_energy_diagnostics(before, outgoing) is None
