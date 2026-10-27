@@ -34,6 +34,23 @@ def test_launch_quality_rewards_targeted_replies_without_a_flat_contact_bonus():
     assert 0 < legacy[3] < quality[3]  # Heavy tails keep a learning signal for the observed large error.
 
 
+def test_separated_launch_quality_uses_the_complete_strike_to_target_flight_time():
+    """A real 170ms on-target arc retains its reward when observed 20ms after its impact."""
+    position = torch.tensor([[0.0, 0.0, 0.3]])
+    target = torch.tensor([[0.3, 0.0, 0.3]])
+    velocity = torch.tensor([[0.3 / 0.17, 0.0, 9.81 * 0.17 / 2]])
+    at_impact = rules.launch_quality(position, velocity, target, 0.065, 0.16, smooth=True)
+    gravity = torch.tensor([[0.0, 0.0, -9.81]])
+    later_position = position + velocity * 0.02 + 0.5 * gravity * 0.02**2
+    later_velocity = velocity + gravity * 0.02
+    separated = rules.launch_quality(
+        later_position, later_velocity, target, 0.065, 0.16, smooth=True, elapsed_flight=torch.tensor([0.02])
+    )
+    torch.testing.assert_close(at_impact, torch.ones(1))
+    torch.testing.assert_close(separated, at_impact)
+    assert not rules.launch_quality(later_position, later_velocity, target, 0.065, 0.16, smooth=True).any()
+
+
 def test_center_buffer_anticipates_inward_motion_without_penalizing_a_safe_step():
     """Walking safely or moving away from center is allowed; an imminent center crossing has a cost."""
     position = torch.tensor([[-0.175, -0.13, -0.12, -0.12]])

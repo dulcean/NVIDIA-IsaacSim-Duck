@@ -158,6 +158,7 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
                 self.cfg.target_radius,
                 self.cfg.minimum_flight_time,
                 smooth=True,
+                elapsed_flight=self._launch_age[:, player],
             )
             credit = quality * (ready[:, player] & active).float()
             self._release_event += credit

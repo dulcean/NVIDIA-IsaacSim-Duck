@@ -260,6 +260,44 @@ The driver creates a new run directory and adds 1000 iterations to the saved
 alone is not a passing skill result. Future resumes of its new `latest.pt`
 automatically keep player symmetry enabled.
 
+## Diagnosing inaccurate aimed returns
+
+The next uploaded run `2026-10-27_13-52-42-834914` passed forehead reception
+and reached `aim_return`. Across its stage-2 evaluations, legal-hit counts were
+about 0.89--0.98 per episode while target success stayed below 10% per side.
+The final cohort contained 124 misses and four successes; 70 episodes included
+a ball-outside miss and 35 a ball-ground miss. Reason counts may overlap. RGB
+position errors were about 8--9 mm over accepted measurements across the run;
+this does not measure accuracy during every impact or camera dropout.
+
+A confirmed reward-clock mismatch has been corrected: delayed launch quality
+now counts elapsed time since the strike. A correct 170 ms arc observed 20 ms
+after impact has only 150 ms remaining, but still satisfies the actual 160 ms
+strike-to-target horizon. Previously its launch bonus was zero. The impact-time
+caller's default remains zero elapsed time. This correction does not establish
+the cause of all observed misses or demonstrate improved physical behavior.
+
+Before allocating another learning budget, collect actual post-impact motion:
+
+```bash
+uv run python scripts/tools/trace_microduck_vision.py \
+  --checkpoint logs/rsl_rl/microduck_volley_vision/2026-10-27_13-52-42-834914/stage_2_best.pt \
+  --stage 2 --episodes-per-side 8 \
+  --output logs/microduck_aim_trace.json
+```
+
+This loads the existing visual actor without adaptation, optimizer updates or
+physics changes. Two normal worlds use balanced, fixed first-episode cohorts.
+It writes JSON and CSV with 5 ms samples, actual target disks, ball velocities,
+head orientations, contact points/forces, tracker validity, and terminal episode
+records. It samples outgoing flight only after separation and the configured
+20 ms delay, without crossing resets or subsequent head impacts. Predictions
+use the real virtual target, not the parked coach's head. The summary separates
+wrong-direction, non-upward and unreachable-height launches and compares old
+versus corrected timing gates. Predictions do not count as measured successes.
+CPU tests cover the analytic diagnostic boundaries; the new trace command
+still requires execution on the NVIDIA host.
+
 ## Preview performance
 
 Capture uses a global clock independent of each world's episode reset: at the default

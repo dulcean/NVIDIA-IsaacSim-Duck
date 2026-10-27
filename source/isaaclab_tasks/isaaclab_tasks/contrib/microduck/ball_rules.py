@@ -56,14 +56,28 @@ def launch_quality(
     radius: float,
     min_flight: float,
     smooth: bool,
+    elapsed_flight: torch.Tensor | float = 0.0,
 ) -> torch.Tensor:
-    """Score the descending ballistic crossing; heavy tails retain feedback for inaccurate replies."""
+    """Score a descending crossing, counting time since impact rather than since sampling.
+
+    ``elapsed_flight`` is nonzero when scoring after physical contact separation.
+    The minimum horizon refers to the complete strike-to-target flight, matching
+    actual return/crossing checks. The default preserves impact-time callers.
+    Heavy tails retain feedback for inaccurate replies.
+    """
     discriminant = velocity[:, 2].square() + 2 * 9.81 * (position[:, 2] - target[:, 2])
     flight = (velocity[:, 2] + discriminant.clamp_min(0).sqrt()) / 9.81
     landing = position[:, :2] + velocity[:, :2] * flight.unsqueeze(-1)
     error = (landing - target[:, :2]).square().sum(-1) / radius**2
     quality = 1 / (1 + error) if smooth else torch.exp(-error)
-    return quality * ((discriminant > 0) & (velocity[:, 2] > 0.1) & (flight > min_flight))
+    elapsed = torch.as_tensor(elapsed_flight, dtype=velocity.dtype, device=velocity.device)
+    return quality * (
+        (discriminant > 0)
+        & (velocity[:, 2] > 0.1)
+        & torch.isfinite(elapsed)
+        & (elapsed >= 0)
+        & (flight + elapsed > min_flight)
+    )
 
 
 def center_approach_error(
