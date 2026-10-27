@@ -107,6 +107,37 @@ def resume_metadata(checkpoint, profile):
     return metadata
 
 
+def player_symmetry_settings(metadata, requested, state):
+    """Persist an enabled PPO method across resumes; identify its first explicit activation."""
+    saved = metadata.get("player_symmetry", False)
+    if type(saved) is not bool:
+        raise ValueError("Saved player-symmetry setting must be a boolean.")
+    newly_enabled = bool(requested and not saved)
+    if newly_enabled:
+        # A fresh run already has zero counters; an explicit method change on
+        # resume earns one new stagnation window without claiming any pass.
+        state.failed_evaluations = 0
+        state.consecutive_passes = 0
+    return saved or requested
+
+
+def configure_player_symmetry(agent, state, metadata, args):
+    """Enable identity exchange without modifying the saved actor or adding model parameters."""
+    enabled = player_symmetry_settings(metadata, args.player_symmetry, state)
+    if enabled and not args.vision:
+        raise ValueError("Player symmetry requires visual 152-input observations.")
+    if enabled:
+        from isaaclab_rl.rsl_rl import RslRlSymmetryCfg
+
+        agent.algorithm.symmetry_cfg = RslRlSymmetryCfg(
+            data_augmentation_func="isaaclab_tasks.contrib.microduck.player_symmetry:exchange_players",
+            use_data_augmentation=True,
+            use_mirror_loss=True,
+            mirror_loss_coeff=1.0,
+        )
+    return enabled
+
+
 def _task_components(vision):
     """Load one complete observation/profile contract before constructing the simulation."""
     if vision:
@@ -173,6 +204,7 @@ def train(args):
     source_path = args.resume or args.checkpoint
     source = torch.load(source_path, weights_only=True, map_location="cpu")
     history = {}
+    metadata = {}
     total = 0
     test_trials = 0
     certified = False
@@ -202,6 +234,7 @@ def train(args):
     agent = AgentCfg()
     agent.device = args.device
     agent.seed = args.seed
+    player_symmetry = configure_player_symmetry(agent, state, metadata, args)
     (run_dir / "launch.json").write_text(json.dumps(vars(args), default=str, indent=2) + "\n")
     (run_dir / "environment.json").write_text(json.dumps(to_dict(cfg), default=str, indent=2) + "\n")
     (run_dir / "agent.json").write_text(json.dumps(to_dict(agent), default=str, indent=2) + "\n")
@@ -224,6 +257,7 @@ def train(args):
                     "certified": certified,
                     "certification": certification if certified else None,
                     "vision_contract": env.vision_contract() if args.vision else None,
+                    "player_symmetry": player_symmetry,
                 }
             }
             temporary = f"{path}.tmp"
@@ -451,6 +485,11 @@ def main():
     parser.add_argument("--output", type=Path)
     parser.add_argument("--num-envs", type=int, help="Defaults to 32 with --vision, otherwise 1024.")
     parser.add_argument("--vision", action="store_true", help="Use real head RGB tracking for the actor's ball inputs.")
+    parser.add_argument(
+        "--player-symmetry",
+        action="store_true",
+        help="Train both player identities on exchanged visual experiences and policy-consistency loss.",
+    )
     parser.add_argument("--iterations", type=int, default=20000)
     parser.add_argument("--eval-interval", type=int, default=500)
     parser.add_argument("--eval-episodes-per-side", type=int, default=64)
@@ -459,6 +498,8 @@ def main():
     parser.add_argument("--viz", choices=("none", "viser"), default="none")
     parser.add_argument("--visible-envs", type=int, default=4)
     args = parser.parse_args()
+    if args.player_symmetry and not args.vision:
+        parser.error("--player-symmetry requires --vision.")
     if args.num_envs is None:
         args.num_envs = 32 if args.vision else 1024
     path = args.resume or args.checkpoint

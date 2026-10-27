@@ -97,6 +97,26 @@ def test_full_resume_accepts_complete_state_without_mutating_it(resumable_checkp
     assert actual == before and metadata == before
 
 
+def test_player_symmetry_activation_and_resume_do_not_silently_disable_learning_method():
+    """Old runs opt in once; subsequent resumes retain symmetry without restarting their stagnation window."""
+    contract = driver._tool("evaluate_microduck_volley")._curriculum_module("microduck_volley_vision_v2")
+    state = contract.VisionCurriculumState(stage=0)
+    state.failed_evaluations = 4
+    state.last_evaluation_id = 9
+    assert driver.player_symmetry_settings({}, False, state) is False
+    assert state.failed_evaluations == 4
+    gate = state._gate_settings()
+    assert driver.player_symmetry_settings({}, True, state) is True
+    assert state.failed_evaluations == 0 and state.consecutive_passes == 0
+    assert state.stage == 0 and state.last_evaluation_id == 9 and state._gate_settings() == gate
+    state.failed_evaluations = 3
+    assert driver.player_symmetry_settings({"player_symmetry": True}, False, state) is True
+    assert driver.player_symmetry_settings({"player_symmetry": True}, True, state) is True
+    assert state.failed_evaluations == 3
+    with pytest.raises(ValueError, match="boolean"):
+        driver.player_symmetry_settings({"player_symmetry": "false"}, True, state)
+
+
 @pytest.mark.parametrize(
     "damage",
     [

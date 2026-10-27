@@ -216,6 +216,50 @@ learning are not established by these CPU tests. This partial development checko
 lacks the generated environment-browser assets under `docs/source`; the registry updater
 cannot run here without the simulation/Gym dependency environment.
 
+## Continuing a run that learned only one player
+
+The uploaded run `2026-10-26_23-24-49-874011` passed actual RGB localization
+for both cameras (about 3 mm error in the controlled near-ball probe) and the
+first-exposure checks for all lessons. Starting at iteration 1500, every held-out
+evaluation gave receiver success `[0.0, 1.0]`, without unsafe episodes. All 64
+failed receiver-A episodes ended with invalid head contact before the watch
+objective. At iteration 5000, A's mean peak continuous visibility was only about
+25 ms against the 300 ms lesson requirement. This establishes a learned
+asymmetry, rather than evidence that either camera never produces usable pixels.
+The first-exposure checks alone do not establish correct tracking throughout a moving-head trajectory.
+
+Use `--vision --resume RUN/latest.pt --player-symmetry` to enable RSL-RL's player
+exchange augmentation and policy-consistency loss. Each real experience is also
+trained with complete A/B observation and action blocks exchanged. The actor's
+76-value blocks and critic's 71-value blocks are already robot-local, so this is
+a pi rotation of the court without flipping servo or local vector signs. It
+does not introduce privileged critic ball data into actor inputs.
+
+This changes the learning method without changing the actor architecture,
+physical task, camera definitions, success thresholds or stage. Existing actor,
+critic and Adam state are restored. The first explicit activation resets only
+the stagnation counter and pass streak; subsequent resumes retain the enabled
+method and counters. PPO logs the additional `symmetry` loss. This shares learning
+signals; it does not directly copy B's output weights into A or guarantee physical
+skill transfer. A short held-out run must confirm improved A success and retained B success.
+
+CPU verification covers the actual RSL-RL augmented PPO update and an update with
+the uploaded 5000-iteration weights/Adam state, not a physical rollout. Run a
+bounded continuation before another long training budget:
+
+```bash
+nohup uv run python scripts/tools/train_microduck_volley.py \
+  --vision --player-symmetry \
+  --resume logs/rsl_rl/microduck_volley_vision/2026-10-26_23-24-49-874011/latest.pt \
+  --num-envs 256 --iterations 1000 --eval-interval 500 --viz none \
+  > volley_vision_symmetry.log 2>&1 < /dev/null &
+```
+
+The driver creates a new run directory and adds 1000 iterations to the saved
+5000. It evaluates both receivers at 5500 and 6000; completion of this budget
+alone is not a passing skill result. Future resumes of its new `latest.pt`
+automatically keep player symmetry enabled.
+
 ## Preview performance
 
 Capture uses a global clock independent of each world's episode reset: at the default
