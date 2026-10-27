@@ -10,7 +10,7 @@ import torch
 from isaaclab.utils.math import quat_apply_inverse
 
 from .ball_env import MicroDuckBallEnv
-from .ball_rules import launch_quality
+from .ball_rules import launch_progress, launch_quality
 from .ball_serves import descending_target_crossing, incoming_ballistic_serve
 from .volley_curriculum import STAGES
 from .volley_curriculum_env_cfg import MicroDuckVolleyCurriculumEnvCfg
@@ -51,6 +51,7 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
         self._qualified_event = torch.zeros_like(self._qualified_returns)
         self._release_event = torch.zeros_like(self._qualified_returns)
         self._launch_total = torch.zeros_like(self._qualified_returns)
+        self._progress_total = torch.zeros_like(self._qualified_returns)
         self._game_invalid = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._unsafe = torch.zeros_like(self._game_invalid)
         self._terminal_pending = torch.zeros_like(self._game_invalid)
@@ -161,7 +162,19 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
                 elapsed_flight=self._launch_age[:, player],
             )
             credit = quality * (ready[:, player] & active).float()
-            self._release_event += credit
+            progress = (
+                launch_progress(
+                    ball,
+                    self._ball.data.root_link_lin_vel_w.torch,
+                    self._targets[:, player],
+                    self.cfg.target_radius,
+                    self.cfg.minimum_flight_time,
+                    self._launch_age[:, player],
+                )
+                if self.cfg.continuous_launch_shaping
+                else quality
+            )
+            self._release_event += progress * (ready[:, player] & active).float()
             self._launch_total += credit
         self._launch_pending &= ~ready
         if not spec.paired:
@@ -290,6 +303,7 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
 
     def _get_rewards(self):
         stable, potential = self._balance()
+        self._progress_total += self._release_event
         terminal = self._terminal_pending
         # Bounded potential improvement cannot pay repeatedly for standing/crouching cycles.
         next_potential = torch.where(terminal, 0.0, potential)
@@ -366,6 +380,7 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
                     "returns": self._qualified_returns[completed],
                     "goal_reached": self._episode.phase[completed] == 1,
                     "launch_quality": self._launch_total[completed] / self._hits[completed].clamp_min(1),
+                    "launch_progress": self._progress_total[completed] / self._hits[completed].clamp_min(1),
                     "head_hits": self._hits[completed],
                     "head_contacts": self._raw_hits[completed],
                     "recovered_miss": recovered_miss,
@@ -406,6 +421,7 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
                             "returns": int(row["returns"]),
                             "goal_reached": bool(row["goal_reached"]),
                             "launch_quality": row["launch_quality"],
+                            "launch_progress": row["launch_progress"],
                             "head_hits": int(row["head_hits"]),
                             "head_contacts": int(row["head_contacts"]),
                             "recovered_miss": bool(row["recovered_miss"]),
@@ -435,6 +451,7 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
                 "Metrics/head_contacts": sum(r["head_contacts"] for r in records) / len(records),
                 "Metrics/goal_reached": sum(r["goal_reached"] for r in records) / len(records),
                 "Metrics/launch_quality": sum(r["launch_quality"] for r in records) / len(records),
+                "Metrics/launch_progress": sum(r["launch_progress"] for r in records) / len(records),
                 "Metrics/recovered_miss": sum(r["recovered_miss"] for r in records) / len(records),
                 "Metrics/recovery_stable_a": sum(r["recovery_stable_by_player"][0] for r in records) / len(records),
                 "Metrics/recovery_stable_b": sum(r["recovery_stable_by_player"][1] for r in records) / len(records),
@@ -461,6 +478,7 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
             self._qualified_event,
             self._release_event,
             self._launch_total,
+            self._progress_total,
             self._game_invalid,
             self._unsafe,
             self._terminal_pending,

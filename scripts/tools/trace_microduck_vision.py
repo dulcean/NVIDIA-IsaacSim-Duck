@@ -169,6 +169,7 @@ def collect(args):
     from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
     from isaaclab_tasks.contrib.microduck.agents.ball_ppo_cfg import MicroDuckVolleyVisionPPORunnerCfg
+    from isaaclab_tasks.contrib.microduck.volley_task_settings import apply_task_settings, resolve_task_settings
     from isaaclab_tasks.contrib.microduck.volley_vision_env import MicroDuckVolleyVisionEnv
     from isaaclab_tasks.contrib.microduck.volley_vision_env_cfg import MicroDuckVolleyVisionEnvCfg
 
@@ -182,6 +183,8 @@ def collect(args):
     ):
         raise ValueError("Trace requires a finite actor state dictionary.")
     cfg = MicroDuckVolleyVisionEnvCfg()
+    task_settings = resolve_task_settings(metadata, damping_ratio=args.ball_damping_ratio)
+    apply_task_settings(cfg, task_settings)
     cfg.scene.num_envs = 2
     cfg.sim.device = args.device
     cfg.sim.visualizer_cfgs = []
@@ -189,10 +192,6 @@ def collect(args):
     cfg.curriculum_stage = args.stage
     cfg.seed = args.seed
     collision = cfg.scene.ball.spawn.collision_props[1]
-    if args.ball_damping_ratio is not None:
-        # A diagnostic intervention only. Never silently change the training task
-        # or treat success under a different contact model as a qualification pass.
-        collision.solref = (collision.solref[0], args.ball_damping_ratio)
     rows, records = [], []
 
     class TracedVision(MicroDuckVolleyVisionEnv):
@@ -322,6 +321,7 @@ def collect(args):
                     "target_radius_m": cfg.target_radius,
                     "seed": args.seed,
                     "authored_ball_solref": list(collision.solref),
+                    "task_settings": task_settings,
                     "contact_experiment": args.ball_damping_ratio is not None,
                     "training_performed": False,
                 },

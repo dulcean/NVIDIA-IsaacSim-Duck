@@ -97,6 +97,44 @@ def test_full_resume_accepts_complete_state_without_mutating_it(resumable_checkp
     assert actual == before and metadata == before
 
 
+def test_native_visual_warm_start_keeps_actions_without_importing_old_objective_state(resumable_checkpoint):
+    """A native actor survives a real RSL reload; critic, optimizer and stage claims are not resumable."""
+    prepare = driver._tool("prepare_microduck_vision_checkpoint")
+    source = prepare.prepare_vision_checkpoint(resumable_checkpoint)
+    metadata = source["infos"]["microduck_curriculum"]
+    metadata["vision_contract"] = {"version": 3, "actor_width": 152}
+    source["optimizer_state_dict"] = resumable_checkpoint["optimizer_state_dict"]
+    source["iter"] = 14000
+    source["actor_state_dict"]["obs_normalizer.count"].fill_(100)
+    source["actor_state_dict"]["obs_normalizer._mean"].fill_(0.1)
+    groups = {"actor": ["policy"], "critic": ["critic"]}
+    obs = TensorDict({"policy": torch.randn(2, 152), "critic": torch.zeros(2, 142)}, batch_size=[2])
+    actor = MLPModel(
+        obs,
+        groups,
+        "actor",
+        28,
+        hidden_dims=[1024, 512, 256],
+        activation="elu",
+        obs_normalization=True,
+        distribution_cfg={"class_name": "GaussianDistribution", "init_std": 0.15, "std_type": "scalar"},
+    )
+    actor.load_state_dict(source["actor_state_dict"], strict=True)
+    actor.eval()
+    with torch.inference_mode():
+        before = actor(obs).clone()
+    warm = driver.prepare_starting_checkpoint(source, prepare.VISION_PROFILE, prepare.prepare_vision_checkpoint)
+    actor.load_state_dict(warm["actor_state_dict"], strict=True)
+    with torch.inference_mode():
+        torch.testing.assert_close(actor(obs), before, rtol=0, atol=0)
+    assert not {"critic_state_dict", "optimizer_state_dict", "iter"}.intersection(warm)
+    assert "curriculum_state" not in warm["infos"]["microduck_curriculum"]
+    with pytest.raises(ValueError, match="warm start"):
+        driver.resume_metadata(warm, prepare.VISION_PROFILE)
+    warm["actor_state_dict"]["mlp.0.bias"].add_(1)
+    assert not torch.equal(warm["actor_state_dict"]["mlp.0.bias"], source["actor_state_dict"]["mlp.0.bias"])
+
+
 def test_player_symmetry_activation_and_resume_do_not_silently_disable_learning_method():
     """Old runs opt in once; subsequent resumes retain symmetry without restarting their stagnation window."""
     contract = driver._tool("evaluate_microduck_volley")._curriculum_module("microduck_volley_vision_v2")

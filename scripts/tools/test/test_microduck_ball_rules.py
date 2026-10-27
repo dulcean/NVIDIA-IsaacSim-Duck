@@ -34,6 +34,34 @@ def test_launch_quality_rewards_targeted_replies_without_a_flat_contact_bonus():
     assert 0 < legacy[3] < quality[3]  # Heavy tails keep a learning signal for the observed large error.
 
 
+def test_launch_progress_ranks_weak_physical_strikes_without_relaxing_the_quality_gate():
+    """Short arcs and unreachable heights have useful feedback; explosive overshoots remain poor shots."""
+    position = torch.tensor([[0.0, 0.0, 0.3]] * 7)
+    velocity = torch.tensor(
+        [
+            [0.4, 0.0, 0.2],
+            [0.8, 0.0, 0.4],
+            [1.2, 0.0, 0.6],
+            [1.75, 0.0, 0.981],
+            [4.4, 0.0, 4.8],
+            [0.8, 0.0, 0.4],
+            [0.8, 0.0, 1.0],
+        ]
+    )
+    position[5:, 2] = 0.1
+    target = torch.tensor([[0.35, 0.0, 0.3]] * 7)
+    elapsed = torch.zeros(7)
+    progress = rules.launch_progress(position, velocity, target, 0.065, 0.16, elapsed)
+    assert 0 < progress[0] < progress[1] < progress[2] < progress[3]
+    assert progress[3].item() == pytest.approx(1)
+    assert progress[4] < progress[0]
+    assert 0 < progress[5] < progress[6]
+    quality = rules.launch_quality(position, velocity, target, 0.065, 0.16, smooth=True)
+    assert not quality[:3].any() and not quality[5:].any()
+    velocity[0, 0] = float("nan")
+    assert rules.launch_progress(position, velocity, target, 0.065, 0.16, elapsed)[0] == 0
+
+
 def test_separated_launch_quality_uses_the_complete_strike_to_target_flight_time():
     """A real 170ms on-target arc retains its reward when observed 20ms after its impact."""
     position = torch.tensor([[0.0, 0.0, 0.3]])

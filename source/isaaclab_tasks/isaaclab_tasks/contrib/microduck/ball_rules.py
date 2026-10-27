@@ -80,6 +80,31 @@ def launch_quality(
     )
 
 
+def launch_progress(
+    position: torch.Tensor,
+    velocity: torch.Tensor,
+    target: torch.Tensor,
+    radius: float,
+    min_flight: float,
+    elapsed_flight: torch.Tensor,
+) -> torch.Tensor:
+    """Shape an actual released strike without the success metric's hard flight gate.
+
+    Reachable targets use the descending target-height crossing. When the ball
+    cannot reach that height, score its apex in three dimensions instead of
+    returning a constant zero. Short flights receive a continuous time deficit.
+    This is feedback only: physical target crossings and recovery still own
+    task success. No predicted trajectory is supplied to the actor or simulator.
+    """
+    discriminant = velocity[:, 2].square() + 2 * 9.81 * (position[:, 2] - target[:, 2])
+    flight = ((velocity[:, 2] + discriminant.clamp_min(0).sqrt()) / 9.81).clamp_min(0)
+    predicted = position + velocity * flight.unsqueeze(-1)
+    predicted[:, 2] -= 0.5 * 9.81 * flight.square()
+    error = ((predicted - target) / radius).square().sum(-1)
+    shortfall = ((min_flight - flight - elapsed_flight).clamp_min(0) / min_flight).square()
+    return torch.nan_to_num(1 / (1 + error + shortfall), nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def center_approach_error(
     inward_position: torch.Tensor, inward_speed: torch.Tensor, buffer: float, lookahead: float
 ) -> torch.Tensor:

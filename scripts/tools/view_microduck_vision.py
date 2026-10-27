@@ -46,6 +46,7 @@ def preview(args) -> dict:
     from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
     from isaaclab_tasks.contrib.microduck.agents.ball_ppo_cfg import MicroDuckVolleyVisionPPORunnerCfg
+    from isaaclab_tasks.contrib.microduck.volley_task_settings import apply_task_settings, resolve_task_settings
     from isaaclab_tasks.contrib.microduck.volley_vision_env import MicroDuckVolleyVisionEnv
     from isaaclab_tasks.contrib.microduck.volley_vision_env_cfg import MicroDuckVolleyVisionEnvCfg
 
@@ -65,6 +66,8 @@ def preview(args) -> dict:
         raise ValueError("The preview requires a finite actor state dictionary.")
     torch.manual_seed(args.seed)
     cfg = MicroDuckVolleyVisionEnvCfg()
+    task_settings = resolve_task_settings(metadata)
+    apply_task_settings(cfg, task_settings)
     cfg.scene.num_envs = args.num_envs
     cfg.sim.device = args.device
     cfg.curriculum_stage = args.stage
@@ -80,6 +83,7 @@ def preview(args) -> dict:
     samples = []
     saved = []
     report = {
+        "task_settings": task_settings,
         "checkpoint": str(args.checkpoint.resolve()),
         "checkpoint_profile": checkpoint["infos"]["microduck_curriculum"]["profile"],
         "source_checkpoint_profile": source_profile,

@@ -23,6 +23,7 @@ class MicroDuckVolleyCurriculumEnvCfg(MicroDuckVolleyEnvCfg):
     minimum_flight_time: float = 0.16
     minimum_crossing_height: float = 0.20
     release_delay: float = 0.02
+    continuous_launch_shaping: bool = False
     maximum_ball_hold: float = 0.08
     recovery_duration: float = 0.6
     recovery_hold = 0.25

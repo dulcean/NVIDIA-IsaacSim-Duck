@@ -357,7 +357,10 @@ def collect(args: argparse.Namespace) -> dict:
         from isaaclab_tasks.contrib.microduck.volley_curriculum_env import MicroDuckVolleyCurriculumEnv as Environment
         from isaaclab_tasks.contrib.microduck.volley_curriculum_env_cfg import MicroDuckVolleyCurriculumEnvCfg as EnvCfg
 
+    from isaaclab_tasks.contrib.microduck.volley_task_settings import apply_task_settings, resolve_task_settings
+
     cfg = EnvCfg()
+    apply_task_settings(cfg, resolve_task_settings(metadata))
     cfg.scene.num_envs = args.num_envs
     cfg.sim.visualizer_cfgs = []
     cfg.seed = args.seed

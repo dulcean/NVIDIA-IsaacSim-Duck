@@ -335,6 +335,56 @@ that extreme speed gains disappear without eliminating useful upward returns;
 do not choose damping from target success on 16 episodes alone. No weights,
 optimizer state, task defaults, joint controls or camera settings are modified.
 
+The `0.5` comparison subsequently completed 16 episodes with zero successes and
+zero unsafe outcomes. All 15 sampled strikes lost translational mechanical
+energy; maximum outgoing speed was 1.18 m/s, versus 6.53 m/s in the original
+cohort. Five launches could not reach the target-height plane, and 13 failed the
+hard quality gate. This supports investigating controlled stronger strikes under
+the more damped contact. It does not calibrate restitution to a real ball or
+establish timestep convergence. Identical seeds do not make later cohorts exact
+paired serves: different terminal times can trigger extra automatic resets and
+consume the serve generator differently.
+
+An opt-in continuous release reward now ranks weak launches without changing
+the physical success metric. It scores the descending target-height crossing
+when reachable, or the future apex in 3D when the ball cannot reach the target
+height, with a continuous flight-time deficit. This removes the zero-feedback
+region for weak strikes while still assigning low scores to large overshoots.
+It is paid once after a legal release through the existing 0.2 coefficient;
+there are no scripted forces or joint restrictions. `Metrics/launch_progress`
+tracks this shaping separately from the unchanged gated `Metrics/launch_quality`.
+Neither prediction can satisfy a curriculum gate or certify a playable policy.
+
+For a bounded adaptation run from the best visual actor:
+
+```bash
+nohup uv run python scripts/tools/train_microduck_volley.py \
+  --vision --player-symmetry \
+  --checkpoint logs/rsl_rl/microduck_volley_vision/2026-10-27_13-52-42-834914/stage_2_best.pt \
+  --start-stage 2 \
+  --ball-damping-ratio 0.5 --continuous-launch-shaping \
+  --num-envs 256 --iterations 1000 \
+  --eval-interval 250 --eval-episodes-per-side 64 \
+  --device cuda:0 --seed 42 --viz none \
+  > volley_aim_adaptation.log 2>&1 &
+```
+
+This is an exploratory adaptation changing contact damping and release shaping
+together, not a single-variable causal ablation or a verified convergence recipe.
+The old actor and its normalizer load exactly; the critic, optimizer, counters,
+best-model history and certification start fresh. Camera/sensor contract changes
+are still rejected. `--start-stage` selects a fresh lesson only and cannot be
+combined with a full resume. Starting at stage 2 is an explicit warm start, not
+a claim that earlier lessons passed under the modified physics.
+
+New checkpoints save `task_settings`. Resumes, the visual viewer, evaluator and
+trace tool restore those contact/reward settings even when their CLI flags are
+omitted. A changed contact or reward on `--resume` is rejected; use `--checkpoint`
+to start a new objective. Old checkpoints retain their authored `(0.02, 0.15)`
+contact and legacy gated reward by default. Preserve the original checkpoints.
+Compare `evaluations/*.json`, actual per-side target success and safety before
+extending the 1000-iteration budget; reward growth alone does not prove accuracy.
+
 ## Preview performance
 
 Capture uses a global clock independent of each world's episode reset: at the default

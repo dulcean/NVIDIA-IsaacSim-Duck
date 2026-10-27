@@ -121,6 +121,36 @@ def player_symmetry_settings(metadata, requested, state):
     return saved or requested
 
 
+def prepare_starting_checkpoint(source, profile, prepare_weights):
+    """Warm start an existing visual actor exactly, without importing its value/objective state."""
+    import torch
+
+    metadata = (source.get("infos") or {}).get("microduck_curriculum", {})
+    if profile != "microduck_volley_vision_v2" or metadata.get("profile") != profile:
+        return prepare_weights(source)
+    actor = source.get("actor_state_dict")
+    if (
+        not isinstance(actor, dict)
+        or not actor
+        or any(not isinstance(value, torch.Tensor) or not torch.isfinite(value).all() for value in actor.values())
+        or "vision_contract" not in metadata
+    ):
+        raise ValueError("A native visual warm start requires finite actor weights and a saved camera contract.")
+    return {
+        "actor_state_dict": {name: value.detach().clone() for name, value in actor.items()},
+        "infos": {
+            "microduck_curriculum": {
+                **{
+                    name: metadata[name]
+                    for name in ("profile", "vision_contract", "task_settings", "player_symmetry")
+                    if name in metadata
+                },
+                "native_actor_warm_start": True,
+            }
+        },
+    }
+
+
 def configure_player_symmetry(agent, state, metadata, args):
     """Enable identity exchange without modifying the saved actor or adding model parameters."""
     enabled = player_symmetry_settings(metadata, args.player_symmetry, state)
@@ -195,9 +225,11 @@ def train(args):
 
     from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
+    from isaaclab_tasks.contrib.microduck.volley_task_settings import apply_task_settings, resolve_task_settings
+
     EnvCfg, Environment, AgentCfg, prepare_weights, profile, experiment, State = _task_components(args.vision)
     evaluator = _tool("evaluate_microduck_volley")
-    state = State(min_attempts_per_side=args.eval_episodes_per_side)
+    state = State(stage=args.start_stage, min_attempts_per_side=args.eval_episodes_per_side)
     run_dir = args.output or Path("logs/rsl_rl") / experiment / datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
     run_dir.mkdir(parents=True, exist_ok=False)
     torch.manual_seed(args.seed)
@@ -209,6 +241,7 @@ def train(args):
     test_trials = 0
     certified = False
     certification = None
+    native_warm_start = False
     if args.resume:
         metadata = resume_metadata(source, profile)
         state.load_state_dict(metadata["curriculum_state"])
@@ -221,10 +254,19 @@ def train(args):
             state.complete = False  # A final validation pass interrupted before the independent test is not certified.
         initial = source_path
     else:
-        converted = prepare_weights(source)
+        converted = prepare_starting_checkpoint(source, profile, prepare_weights)
+        metadata = converted["infos"]["microduck_curriculum"]
+        native_warm_start = metadata.get("native_actor_warm_start", False)
         initial = run_dir / "initial.pt"
         torch.save(converted, initial)
     cfg = EnvCfg()
+    task_settings = resolve_task_settings(
+        metadata,
+        damping_ratio=args.ball_damping_ratio,
+        continuous=args.continuous_launch_shaping,
+        resume=bool(args.resume),
+    )
+    apply_task_settings(cfg, task_settings)
     cfg.scene.num_envs = args.num_envs
     cfg.sim.device = args.device
     cfg.curriculum_stage = state.stage
@@ -258,6 +300,8 @@ def train(args):
                     "certification": certification if certified else None,
                     "vision_contract": env.vision_contract() if args.vision else None,
                     "player_symmetry": player_symmetry,
+                    "task_settings": task_settings,
+                    "warm_start_source": str(source_path) if not args.resume else metadata.get("warm_start_source"),
                 }
             }
             temporary = f"{path}.tmp"
@@ -288,14 +332,23 @@ def train(args):
         env = Environment(cfg)
         runner = None
         try:
-            if args.resume and args.vision and metadata.get("vision_contract") != env.vision_contract():
+            if (
+                (args.resume or native_warm_start)
+                and args.vision
+                and metadata.get("vision_contract") != env.vision_contract()
+            ):
                 raise ValueError("Saved visual observation/camera contract differs from this environment.")
             wrapped = RslRlVecEnvWrapper(env, clip_actions=agent.clip_actions)
             runner = CurriculumRunner(wrapped, to_dict(agent), log_dir=str(run_dir), device=args.device)
             runner.add_git_repo_to_log(__file__)
             runner.load(
                 str(initial),
-                load_cfg={"actor": True, "critic": True, "iteration": True, "optimizer": bool(args.resume)},
+                load_cfg={
+                    "actor": True,
+                    "critic": not native_warm_start,
+                    "iteration": bool(args.resume),
+                    "optimizer": bool(args.resume),
+                },
                 map_location=args.device,
             )
             runner.current_learning_iteration = total
@@ -479,7 +532,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument(
-        "--checkpoint", type=Path, help="Legacy standing, heading, or paired weights for fresh curriculum."
+        "--checkpoint", type=Path, help="Actor weights for a fresh objective; accepts native visual checkpoints."
     )
     source.add_argument("--resume", type=Path, help="latest.pt from this driver; restores curriculum and optimizer.")
     parser.add_argument("--output", type=Path)
@@ -491,6 +544,11 @@ def main():
         help="Train both player identities on exchanged visual experiences and policy-consistency loss.",
     )
     parser.add_argument("--iterations", type=int, default=20000)
+    parser.add_argument("--start-stage", type=int, choices=range(6), default=0, help="Fresh warm-start lesson only.")
+    parser.add_argument("--ball-damping-ratio", type=float, help="Author and persist the ball's solref damping ratio.")
+    parser.add_argument(
+        "--continuous-launch-shaping", action="store_true", help="Rank weak released strikes continuously."
+    )
     parser.add_argument("--eval-interval", type=int, default=500)
     parser.add_argument("--eval-episodes-per-side", type=int, default=64)
     parser.add_argument("--device", default="cuda:0")
@@ -498,6 +556,8 @@ def main():
     parser.add_argument("--viz", choices=("none", "viser"), default="none")
     parser.add_argument("--visible-envs", type=int, default=4)
     args = parser.parse_args()
+    if args.resume and args.start_stage:
+        parser.error("--start-stage requires --checkpoint; full resumes retain their saved stage.")
     if args.player_symmetry and not args.vision:
         parser.error("--player-symmetry requires --vision.")
     if args.num_envs is None:
