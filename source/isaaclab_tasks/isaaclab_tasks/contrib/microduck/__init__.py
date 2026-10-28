@@ -8,6 +8,16 @@
 import gymnasium as gym
 
 gym.register(
+    id="IsaacContrib-Ballet-MicroDuck",
+    entry_point=f"{__name__}.ballet_env:MicroDuckBalletEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ballet_env_cfg:MicroDuckBalletEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{__name__}.agents.ballet_ppo_cfg:MicroDuckBalletPPORunnerCfg",
+    },
+)
+
+gym.register(
     id="IsaacContrib-Velocity-Flat-MicroDuck",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
