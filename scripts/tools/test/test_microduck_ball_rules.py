@@ -1,0 +1,310 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""CPU contracts for volley turn order and robot collisions."""
+
+import importlib.util
+from pathlib import Path
+
+import pytest
+import torch
+
+_PATH = Path(__file__).resolve().parents[3] / "source/isaaclab_tasks/isaaclab_tasks/contrib/microduck/ball_rules.py"
+_SPEC = importlib.util.spec_from_file_location("microduck_ball_rules", _PATH)
+rules = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(rules)
+
+
+def test_launch_quality_rewards_targeted_replies_without_a_flat_contact_bonus():
+    """Known 0.2 s arcs miss by 0, 9, 18 or 39 cm; unreachable arcs cannot earn quality credit."""
+    positions = torch.tensor([[0.0, 0.0, 0.3]] * 5)
+    velocity = torch.tensor([[1.75, y, 0.981] for y in (0.0, 0.45, 0.9, 1.95, 0.0)])
+    positions[4, 2] = 0.1
+    velocity[4, 2] = 0.2
+    targets = torch.tensor([[0.35, 0.0, 0.3]] * 5)
+    quality = rules.launch_quality(positions, velocity, targets, 0.09, 0.08, smooth=True)
+    torch.testing.assert_close(quality, torch.tensor([1.0, 0.5, 0.2, 1 / (1 + (0.39 / 0.09) ** 2), 0.0]))
+    # The transfer component pays all five points only for an accurately directed reply.
+    assert (5 * quality[0]).item() == pytest.approx(5)
+    assert (5 * quality[3]).item() < 0.26
+    legacy = rules.launch_quality(positions, velocity, targets, 0.09, 0.08, smooth=False)
+    assert legacy[1].item() == pytest.approx(0.36787944, abs=1e-6)
+    assert 0 < legacy[3] < quality[3]  # Heavy tails keep a learning signal for the observed large error.
+
+
+def test_launch_progress_ranks_weak_physical_strikes_without_relaxing_the_quality_gate():
+    """Short arcs and unreachable heights have useful feedback; explosive overshoots remain poor shots."""
+    position = torch.tensor([[0.0, 0.0, 0.3]] * 7)
+    velocity = torch.tensor(
+        [
+            [0.4, 0.0, 0.2],
+            [0.8, 0.0, 0.4],
+            [1.2, 0.0, 0.6],
+            [1.75, 0.0, 0.981],
+            [4.4, 0.0, 4.8],
+            [0.8, 0.0, 0.4],
+            [0.8, 0.0, 1.0],
+        ]
+    )
+    position[5:, 2] = 0.1
+    target = torch.tensor([[0.35, 0.0, 0.3]] * 7)
+    elapsed = torch.zeros(7)
+    progress = rules.launch_progress(position, velocity, target, 0.065, 0.16, elapsed)
+    assert 0 < progress[0] < progress[1] < progress[2] < progress[3]
+    assert progress[3].item() == pytest.approx(1)
+    assert progress[4] < progress[0]
+    assert 0 < progress[5] < progress[6]
+    quality = rules.launch_quality(position, velocity, target, 0.065, 0.16, smooth=True)
+    assert not quality[:3].any() and not quality[5:].any()
+    velocity[0, 0] = float("nan")
+    assert rules.launch_progress(position, velocity, target, 0.065, 0.16, elapsed)[0] == 0
+
+
+def test_separated_launch_quality_uses_the_complete_strike_to_target_flight_time():
+    """A real 170ms on-target arc retains its reward when observed 20ms after its impact."""
+    position = torch.tensor([[0.0, 0.0, 0.3]])
+    target = torch.tensor([[0.3, 0.0, 0.3]])
+    velocity = torch.tensor([[0.3 / 0.17, 0.0, 9.81 * 0.17 / 2]])
+    at_impact = rules.launch_quality(position, velocity, target, 0.065, 0.16, smooth=True)
+    gravity = torch.tensor([[0.0, 0.0, -9.81]])
+    later_position = position + velocity * 0.02 + 0.5 * gravity * 0.02**2
+    later_velocity = velocity + gravity * 0.02
+    separated = rules.launch_quality(
+        later_position, later_velocity, target, 0.065, 0.16, smooth=True, elapsed_flight=torch.tensor([0.02])
+    )
+    torch.testing.assert_close(at_impact, torch.ones(1))
+    torch.testing.assert_close(separated, at_impact)
+    assert not rules.launch_quality(later_position, later_velocity, target, 0.065, 0.16, smooth=True).any()
+
+
+def test_center_buffer_anticipates_inward_motion_without_penalizing_a_safe_step():
+    """Walking safely or moving away from center is allowed; an imminent center crossing has a cost."""
+    position = torch.tensor([[-0.175, -0.13, -0.12, -0.12]])
+    speed = torch.tensor([[0.0, 0.1, 0.4, -0.4]])
+    error = rules.center_approach_error(position, speed, buffer=0.08, lookahead=0.2)
+    torch.testing.assert_close(error, torch.tensor([[0.0, 0.0, 0.25, 0.0]]))
+
+
+def test_compression_ignores_brief_crouch_and_takeoff_but_detects_sustained_sag():
+    """A jump preparation and takeoff remain free; the recorded collapsed-height pattern is penalized."""
+    state = rules.SustainedCompression(1, 2, "cpu")
+    height = torch.tensor([[0.05, 0.05]])
+    initial = torch.full_like(height, 0.125)
+    vertical = torch.zeros_like(height)
+    for _ in range(5):
+        cost = state.step(height, initial, vertical, 0.02, 0.8, 0.12, 0.1)
+        assert not cost.any()
+    vertical[0, 0] = 0.2  # Takeoff resets the low-height dwell time instead of punishing a low jump.
+    cost = state.step(height, initial, vertical, 0.02, 0.8, 0.12, 0.1)
+    torch.testing.assert_close(cost, torch.tensor([[0.0, 0.16]]))
+    height[:] = 0.11  # Normal supported posture is below spawn height but above the compression threshold.
+    assert not state.step(height, initial, vertical, 0.02, 0.8, 0.12, 0.1).any()
+
+
+def test_compression_subset_reset_cannot_carry_a_previous_collapse_into_a_new_episode():
+    state = rules.SustainedCompression(2, 1, "cpu")
+    height = torch.full((2, 1), 0.05)
+    initial = torch.full_like(height, 0.125)
+    vertical = torch.zeros_like(height)
+    for _ in range(5):
+        state.step(height, initial, vertical, 0.02, 0.8, 0.12, 0.1)
+    state.reset(torch.tensor([0]))
+    cost = state.step(height, initial, vertical, 0.02, 0.8, 0.12, 0.1)
+    torch.testing.assert_close(cost, torch.tensor([[0.0], [0.16]]))
+
+
+def test_alternating_onset_accepts_reply_without_flight_time_gate():
+    """A reply from the other robot is legal; wrong turns, wrong surfaces, and persistent touches are not."""
+    valid, surface, turn = rules.classify_head_contact(
+        torch.tensor([True, True, True, False, True]),
+        torch.tensor([True, True, False, True, True]),
+        torch.tensor([1, 0, 1, 1, 1]),
+        torch.tensor([0, 1, 0, 0, 0]),
+        torch.tensor([False, False, False, False, True]),
+        player=1,
+        num_players=2,
+    )
+    assert valid.tolist() == [True, False, False, False, False]
+    assert surface.tolist() == [False, False, True, False, False]
+    assert turn.tolist() == [False, True, False, False, False]
+
+
+def test_heading_still_allows_only_one_strike():
+    """Removing the pair's flight-time gate must not turn single-robot heading into juggling."""
+    valid, surface, turn = rules.classify_head_contact(
+        torch.ones(2, dtype=torch.bool),
+        torch.ones(2, dtype=torch.bool),
+        torch.zeros(2, dtype=torch.long),
+        torch.tensor([-1, 0]),
+        torch.zeros(2, dtype=torch.bool),
+        player=0,
+        num_players=1,
+    )
+    assert valid.tolist() == [True, False]
+    assert surface.tolist() == [False, False]
+    assert turn.tolist() == [False, True]
+
+
+def test_robot_contacts_do_not_cancel_or_count_subthreshold_noise():
+    """Opposing body contacts still end a rally, while tiny numerical forces do not."""
+    forces = torch.zeros(4, 2, 2, 3)
+    forces[0, 0, 0, 0] = 1.0
+    forces[0, 1, 1, 0] = -1.0
+    forces[2, 0, 0, 2] = 0.005
+    forces[3, 0, 0, 2] = float("nan")
+    assert rules.robot_collision_mask(forces, 0.01).tolist() == [True, False, False, True]
+
+
+def test_balance_detects_either_partner_tumbling_but_allows_yaw():
+    """One standing partner must not mask a collapsing torso; turning in place remains allowed."""
+    gravity = torch.tensor(
+        [
+            [[0.0, 0.0, -1.0], [0.0, 0.0, -1.0]],
+            [[0.8660254, 0.0, -0.5], [0.0, 0.0, -1.0]],
+            [[0.0, 0.0, -1.0], [0.0, 0.0, 1.0]],
+        ]
+    )
+    angular = torch.zeros(3, 2, 3)
+    angular[0, :, 2] = 5.0
+    angular[1, 0, 1] = 3.0
+    angular[2, 1, 0] = 2.0
+    tilt, tumbling = rules.balance_errors(gravity, angular)
+    torch.testing.assert_close(tilt, torch.tensor([0.0, 0.5, 2.0]))
+    torch.testing.assert_close(tumbling, torch.tensor([0.0, 9.0, 4.0]))
+
+
+def test_recovery_conserves_banked_credit_and_pays_only_once():
+    """The supplied banked credit is released exactly once, without changing its amount."""
+    state = rules.RecoveryRewards(1, 2, "cpu")
+    credit = torch.tensor([[0.8, 5.8]])
+    hits = torch.ones_like(credit)
+    stable = torch.ones_like(credit, dtype=torch.bool)
+    ended = torch.tensor([False])
+    paid, recovered = state.step(credit, hits, stable, ended, 0.02, 0.12, 0.10)
+    assert paid.sum() == 0 and recovered.sum() == 0
+    for _ in range(5):
+        paid, _ = state.step(credit * 0, hits * 0, stable, ended, 0.02, 0.12, 0.10)
+        assert paid.sum() == 0
+    paid, recovered = state.step(credit * 0, hits * 0, stable, ended, 0.02, 0.12, 0.10)
+    torch.testing.assert_close(paid.sum() + 0.4, torch.tensor(7.0))
+    assert recovered.sum() == 2
+    for _ in range(10):
+        paid, recovered = state.step(credit * 0, hits * 0, stable, ended, 0.02, 0.12, 0.10)
+        assert paid.sum() == 0 and recovered.sum() == 0
+
+
+def test_terminal_step_cancels_credit_even_when_recovery_is_ready():
+    """Neither a terminal strike nor a failure at payout time may cash unpaid bonuses."""
+    state = rules.RecoveryRewards(2, 2, "cpu")
+    credit = torch.tensor([[0.8, 5.8], [0.8, 5.8]])
+    hits = torch.ones_like(credit)
+    stable = torch.ones_like(credit, dtype=torch.bool)
+    ongoing = torch.zeros(2, dtype=torch.bool)
+    state.step(credit, hits, stable, ongoing, 0.02, 0.12, 0.10)
+    for _ in range(5):
+        state.step(credit * 0, hits * 0, stable, ongoing, 0.02, 0.12, 0.10)
+    paid, recovered = state.step(credit * 0, hits * 0, stable, torch.tensor([True, False]), 0.02, 0.12, 0.10)
+    assert paid[0].sum() == 0 and recovered[0].sum() == 0
+    torch.testing.assert_close(paid[1].sum(), torch.tensor(6.6))
+    # Two immediate hit bonuses followed by a fall cannot profit from aim or return credit.
+    assert 0.4 + paid[0].sum() - 2.0 < 0
+    paid, _ = state.step(credit, hits, stable, ~ongoing, 0.02, 0.12, 0.10)
+    assert paid.sum() == 0 and state.pending.sum() == 0
+
+
+def test_recovery_requires_continuous_stability_for_each_player_and_resets_per_world():
+    """A balanced partner cannot unlock another player's credit; resetting one world cannot erase another."""
+    state = rules.RecoveryRewards(2, 2, "cpu")
+    credit = torch.ones(2, 2)
+    hits = torch.ones_like(credit)
+    stable = torch.ones_like(credit, dtype=torch.bool)
+    ongoing = torch.zeros(2, dtype=torch.bool)
+    state.step(credit, hits, stable, ongoing, 0.02, 0.12, 0.10)
+    for _ in range(4):
+        state.step(credit * 0, hits * 0, stable, ongoing, 0.02, 0.12, 0.10)
+    stable[:, 1] = False
+    state.step(credit * 0, hits * 0, stable, ongoing, 0.02, 0.12, 0.10)
+    stable[:, 1] = True
+    paid, recovered = state.step(credit * 0, hits * 0, stable, ongoing, 0.02, 0.12, 0.10)
+    torch.testing.assert_close(paid, torch.tensor([[1.0, 0.0], [1.0, 0.0]]))
+    assert recovered.sum() == 2
+    state.reset(torch.tensor([0]))
+    for _ in range(4):
+        paid, _ = state.step(credit * 0, hits * 0, stable, ongoing, 0.02, 0.12, 0.10)
+    torch.testing.assert_close(paid, torch.tensor([[0.0, 0.0], [0.0, 1.0]]))
+
+
+def test_another_own_strike_restarts_recovery_without_losing_credit():
+    """Rapid repeated exchanges bank credit but cannot use stability preceding the newest own hit."""
+    state = rules.RecoveryRewards(1, 1, "cpu")
+    credit = torch.ones(1, 1)
+    stable = torch.ones(1, 1, dtype=torch.bool)
+    ended = torch.tensor([False])
+    state.step(credit, credit, stable, ended, 0.02, 0.12, 0.10)
+    for _ in range(5):
+        state.step(credit * 0, credit * 0, stable, ended, 0.02, 0.12, 0.10)
+    paid, _ = state.step(credit, credit, stable, ended, 0.02, 0.12, 0.10)
+    assert paid.sum() == 0
+    for _ in range(5):
+        paid, _ = state.step(credit * 0, credit * 0, stable, ended, 0.02, 0.12, 0.10)
+        assert paid.sum() == 0
+    paid, recovered = state.step(credit * 0, credit * 0, stable, ended, 0.02, 0.12, 0.10)
+    assert paid.sum() == 2 and recovered.sum() == 2
+
+
+def test_miss_continues_simulation_until_deadline_without_restarting_clock():
+    """A missed rally remains observable for 0.6 s; unrelated worlds keep playing."""
+    state = rules.PostRallyRecovery(2, "cpu")
+    miss = torch.tensor([True, False])
+    no = torch.zeros(2, dtype=torch.bool)
+    stable = ~no
+    done, started, recovered = state.step(miss, no, no, stable, 0.2, 0.6, 0.2)
+    assert started.tolist() == [True, False]
+    assert not done.any() and not recovered.any()
+    for _ in range(2):
+        done, started, recovered = state.step(miss, no, no, stable, 0.2, 0.6, 0.2)
+        assert not done.any() and not started.any() and not recovered.any()
+    done, started, recovered = state.step(miss, no, no, stable, 0.2, 0.6, 0.2)
+    assert done.tolist() == [True, False]
+    assert recovered.tolist() == [True, False]
+    assert not started.any()
+
+
+def test_post_rally_checks_final_hold_and_safety_before_paying():
+    """Early stability cannot hide later collapse; terminal safety and timeout override recovery."""
+    state = rules.PostRallyRecovery(4, "cpu")
+    yes = torch.ones(4, dtype=torch.bool)
+    no = ~yes
+    state.step(yes, no, no, yes, 0.2, 0.6, 0.4)
+    state.step(no, no, no, yes, 0.2, 0.6, 0.4)
+    stable = torch.tensor([True, False, True, True])
+    done, _, recovered = state.step(no, no, no, stable, 0.2, 0.6, 0.4)
+    assert not done.any() and not recovered.any()
+    done, _, recovered = state.step(
+        no,
+        torch.tensor([False, False, False, True]),
+        torch.tensor([False, False, True, False]),
+        yes,
+        0.2,
+        0.6,
+        0.4,
+    )
+    assert done.all()
+    assert recovered.tolist() == [True, False, False, False]
+
+
+def test_post_rally_fall_ends_immediately_and_subset_reset_preserves_other_world():
+    """A collapse during the grace period must not wait for its timer or disappear into a reset."""
+    state = rules.PostRallyRecovery(2, "cpu")
+    yes = torch.ones(2, dtype=torch.bool)
+    no = ~yes
+    state.step(yes, no, no, yes, 0.2, 0.6, 0.2)
+    done, _, recovered = state.step(no, torch.tensor([True, False]), no, yes, 0.2, 0.6, 0.2)
+    assert done.tolist() == [True, False] and not recovered.any()
+    state.reset(torch.tensor([0]))
+    for _ in range(2):
+        done, _, recovered = state.step(no, no, no, yes, 0.2, 0.6, 0.2)
+    assert done.tolist() == [False, True]
+    assert recovered.tolist() == [False, True]

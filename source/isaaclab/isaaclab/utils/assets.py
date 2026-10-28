@@ -39,6 +39,10 @@ _USD_EXTENSIONS = {".usd", ".usda", ".usdc"}
 
 
 _KIT_EXPERIENCE_PATH = str(ISAACLAB_ROOT / "apps" / "isaaclab.python.kit")
+_ISAAC_SIM_ASSET_RELEASE = "6.2"
+_DEFAULT_US_ASSET_ROOT = (
+    f"https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/{_ISAAC_SIM_ASSET_RELEASE}"
+)
 
 # Isaac Sim resolves ``persistent.isaac.asset_root.default``, so it is read first. The
 # legacy ``cloud`` setting is only consulted for experience files that predate it.
@@ -51,9 +55,14 @@ def _parse_kit_asset_root() -> str:
     Returns:
         Value of ``persistent.isaac.asset_root.default``, or of the legacy
         ``persistent.isaac.asset_root.cloud``, from ``isaaclab.python.kit``.
+        Uses the default US asset server when the experience file is absent,
+        including kitless source checkouts and installations.
     """
-    with open(_KIT_EXPERIENCE_PATH) as f:
-        lines = f.readlines()
+    try:
+        with open(_KIT_EXPERIENCE_PATH) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return _DEFAULT_US_ASSET_ROOT
     for setting in _KIT_ASSET_ROOT_SETTINGS:
         pattern = re.compile(rf'\s*persistent\.isaac\.asset_root\.{setting}\s*=\s*"([^"]*)"')
         for line in reversed(lines):  # read from the last line since it's the last setting defined
@@ -64,8 +73,6 @@ def _parse_kit_asset_root() -> str:
 
 
 _ASSET_REGION_PROFILE_ENV_VAR = "ISAACSIM_ASSET_REGION_PROFILE"
-# Update this value when the China mirror moves to a new Isaac Sim asset release.
-_ISAAC_SIM_ASSET_RELEASE = "6.2"
 _CHINA_ASSET_ENDPOINT = "simready-cn.s3.oss-cn-shanghai.aliyuncs.com"
 _US_ASSET_ROOT = _parse_kit_asset_root()
 

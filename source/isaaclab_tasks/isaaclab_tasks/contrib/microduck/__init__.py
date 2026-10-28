@@ -26,3 +26,53 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{__name__}.agents.rsl_rl_ppo_cfg:MicroDuckRoughPPORunnerCfg",
     },
 )
+
+gym.register(
+    id="IsaacContrib-Heading-MicroDuck",
+    entry_point=f"{__name__}.ball_env:MicroDuckBallEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ball_env_cfg:MicroDuckHeadingEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{__name__}.agents.ball_ppo_cfg:MicroDuckHeadingPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="IsaacContrib-Volley-MicroDuck",
+    entry_point=f"{__name__}.ball_env:MicroDuckBallEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ball_env_cfg:MicroDuckVolleyEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{__name__}.agents.ball_ppo_cfg:MicroDuckVolleyPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="IsaacContrib-Volley-Curriculum-MicroDuck",
+    entry_point=f"{__name__}.volley_curriculum_env:MicroDuckVolleyCurriculumEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.volley_curriculum_env_cfg:MicroDuckVolleyCurriculumEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{__name__}.agents.ball_ppo_cfg:MicroDuckVolleyCurriculumPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="IsaacContrib-Volley-Vision-MicroDuck",
+    entry_point=f"{__name__}.volley_vision_env:MicroDuckVolleyVisionEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.volley_vision_env_cfg:MicroDuckVolleyVisionEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{__name__}.agents.ball_ppo_cfg:MicroDuckVolleyVisionPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="IsaacContrib-Volley-LivePass-MicroDuck",
+    entry_point=f"{__name__}.volley_live_pass_env:MicroDuckLivePassEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.volley_live_pass_env_cfg:MicroDuckLivePassEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{__name__}.agents.ball_ppo_cfg:MicroDuckLivePassPPORunnerCfg",
+    },
+)
