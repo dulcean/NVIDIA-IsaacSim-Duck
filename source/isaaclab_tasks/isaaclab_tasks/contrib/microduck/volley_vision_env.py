@@ -12,6 +12,7 @@ import torch
 from isaaclab.utils.math import convert_camera_frame_orientation_convention, quat_apply, quat_mul
 
 from .active_vision import MeasuredVisibilityWindow, active_gaze_reward, camera_gaze_geometry
+from .ball_serves import frontal_serve_source_offset
 from .ball_vision import BallVisualTracker, visual_actor_observations
 from .vision_curriculum import VISION_STAGES
 from .volley_curriculum_env import MicroDuckVolleyCurriculumEnv
@@ -195,10 +196,15 @@ class MicroDuckVolleyVisionEnv(MicroDuckVolleyCurriculumEnv):
     def _serve_height_range(self):
         return self.cfg.stage_serve_heights[self.stage]
 
-    def _serve_source_offset(self, receiving, partner):
-        direction = partner - receiving
-        direction[:, 2] = 0
-        return torch.nn.functional.normalize(direction, dim=-1) * self.cfg.stage_source_distances[self.stage]
+    def _serve_source_offset(self, receiving, partner, lateral_fraction):
+        limits = getattr(self.cfg, "stage_source_distance_limits", None)
+        return frontal_serve_source_offset(
+            receiving,
+            partner,
+            lateral_fraction,
+            self.cfg.stage_source_distances[self.stage],
+            distance_limits=limits[self.stage] if limits is not None else None,
+        )
 
     def _get_rewards(self):
         reward = super()._get_rewards()

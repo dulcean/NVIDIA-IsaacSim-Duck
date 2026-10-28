@@ -70,6 +70,10 @@ def check_vision_sensors(env, *, steps_per_probe: int = 16, tolerance: float = 0
     original_stage, original_evaluation = raw.stage, raw.evaluation
     selected = torch.tensor((0, 1), dtype=torch.long, device=raw.device)
     actions = torch.zeros(raw.num_envs, raw.single_action_space.shape[0], device=raw.device)
+    live_partner = getattr(raw.cfg, "live_partner", False)
+    # The paired layout has a physical head ~.235m ahead at its closest reset.
+    # Keep the radius-.025m probe clear of it and inside the detector's size range.
+    visible_distance = 0.18 if live_partner else 0.25
     body_ids = [raw.scene[f"robot_{side}"].find_bodies(raw.cfg.head_reference_body)[0][0] for side in ("a", "b")]
 
     def camera_pose(player):
@@ -114,6 +118,7 @@ def check_vision_sensors(env, *, steps_per_probe: int = 16, tolerance: float = 0
                     "tracks_clear_after_reset": initially_clear,
                     "completed_steps": 0,
                     "premature_reset": False,
+                    "sphere_distance_m": visible_distance if visible else None,
                     "sides": [],
                 }
                 report["probes"].append(probe)
@@ -122,7 +127,7 @@ def check_vision_sensors(env, *, steps_per_probe: int = 16, tolerance: float = 0
                 for player in range(2):
                     camera_position, forward = camera_pose(player)
                     if visible:
-                        point = camera_position + 0.25 * forward
+                        point = camera_position + visible_distance * forward
                     else:
                         # A lateral airborne point remains outside the narrow
                         # calibrated field of view even if the head starts
@@ -139,7 +144,7 @@ def check_vision_sensors(env, *, steps_per_probe: int = 16, tolerance: float = 0
                     in_front = torch.dot(point - camera_position, forward)
                     geometry_ok &= bool(torch.isfinite(point).all() and height > raw.cfg.ball_radius + 0.1)
                     angle_cosine = in_front / (point - camera_position).norm().clamp_min(1e-6)
-                    geometry_ok &= bool(in_front > 0.2 if visible else angle_cosine.abs() < 0.25)
+                    geometry_ok &= bool(in_front > visible_distance - 0.05 if visible else angle_cosine.abs() < 0.25)
                     positions.append(point)
                 probe["valid_reset_geometry"] = geometry_ok
                 if not (geometry_ok and initially_clear and identities_ok):
@@ -153,9 +158,12 @@ def check_vision_sensors(env, *, steps_per_probe: int = 16, tolerance: float = 0
                 pose = raw._ball.data.root_link_pose_w.torch[selected].clone()
                 pose[:, :3] = torch.stack(positions)
                 raw._ball.write_root_pose_to_sim_index(root_pose=pose, env_ids=selected)
-                raw._ball.write_root_velocity_to_sim_index(
-                    root_velocity=torch.zeros(2, 6, device=raw.device), env_ids=selected
-                )
+                velocity = torch.zeros(2, 6, device=raw.device)
+                if visible and live_partner:
+                    # A small physical toss keeps the closer sphere in frame
+                    # through two exposures; gravity and all collisions remain active.
+                    velocity[:, 2] = 9.81 * max(raw._camera_capture_steps) * raw.cfg.sim.dt
+                raw._ball.write_root_velocity_to_sim_index(root_velocity=velocity, env_ids=selected)
                 raw.scene.write_data_to_sim()
                 raw.sim.forward()
                 raw.scene.update(dt=0.0)

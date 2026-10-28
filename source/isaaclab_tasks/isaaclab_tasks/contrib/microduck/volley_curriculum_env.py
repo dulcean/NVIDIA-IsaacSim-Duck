@@ -307,7 +307,7 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
     def _serve_height_range(self):
         return (0.18, 0.25)
 
-    def _serve_source_offset(self, receiving, partner):
+    def _serve_source_offset(self, receiving, partner, lateral_fraction):
         return None
 
     def _episode_record_fields(self, env_ids):
@@ -537,17 +537,24 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
             [self._uniform(count, -spec.serve_spread, spec.serve_spread) for _ in range(2)], dim=1
         )
         offset[:, 2] = self.cfg.ball_radius
+        flight_time = self._uniform(count, *spec.flight_time_range)
+        height = self._uniform(count, *self._serve_height_range())
+        lateral_fraction = self._uniform(count, *spec.lateral_range)
         source, velocity, _, valid = incoming_ballistic_serve(
             receiving - self.scene.env_origins[env_ids],
             partner - self.scene.env_origins[env_ids],
-            self._uniform(count, *spec.flight_time_range),
-            self._uniform(count, *self._serve_height_range()),
-            self._uniform(count, *spec.lateral_range),
+            flight_time,
+            height,
+            lateral_fraction,
             offset,
-            source_offset=self._serve_source_offset(receiving, partner),
+            source_offset=self._serve_source_offset(receiving, partner, lateral_fraction),
         )
         if not valid.all():
-            raise RuntimeError("Curriculum produced an invalid serve: refusing a nonphysical training batch.")
+            failed = env_ids[~valid]
+            raise RuntimeError(
+                f"Curriculum produced {len(failed)} invalid serves at stage {self.stage} ({spec.name});"
+                f" env IDs {failed[:8].tolist()}. Refusing a nonphysical training batch."
+            )
         pose = self._ball.data.root_link_pose_w.torch[env_ids].clone()
         pose[:, :3] = source + self.scene.env_origins[env_ids]
         speed = torch.zeros(count, 6, device=self.device)

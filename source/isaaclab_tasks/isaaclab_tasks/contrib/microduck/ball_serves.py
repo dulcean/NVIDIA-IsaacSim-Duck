@@ -8,6 +8,34 @@
 import torch
 
 
+def frontal_serve_source_offset(
+    receiver: torch.Tensor,
+    partner: torch.Tensor,
+    lateral_fraction: torch.Tensor,
+    distance: float,
+    *,
+    distance_limits: tuple[float, float] | None = None,
+) -> torch.Tensor:
+    """Return a reset-only frontal offset, optionally bounding total XY launch distance.
+
+    The ordinary offset adds ``distance`` beyond the sampled fraction of the
+    head-to-head gap. Limits bound their *sum* from the receiver, keeping a
+    wider live layout physically reachable without putting near serves above
+    the camera's field of view. No in-flight ball state is modified.
+    """
+    direction = partner - receiver
+    direction = torch.cat((direction[:, :2], torch.zeros_like(direction[:, 2:3])), dim=-1)
+    unit = torch.nn.functional.normalize(direction, dim=-1)
+    if distance_limits is None:
+        return unit * distance
+    low, high = distance_limits
+    if not 0 < low <= high:
+        raise ValueError("Frontal serve distance limits must be positive and ordered.")
+    sampled_distance = direction.norm(dim=-1) * lateral_fraction
+    total_distance = (sampled_distance + distance).clamp(low, high)
+    return unit * (total_distance - sampled_distance)[:, None]
+
+
 def descending_target_crossing(
     previous: torch.Tensor, current: torch.Tensor, target: torch.Tensor, radius: float
 ) -> torch.Tensor:

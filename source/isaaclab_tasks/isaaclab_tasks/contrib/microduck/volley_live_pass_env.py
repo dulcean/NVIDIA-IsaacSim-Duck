@@ -251,6 +251,9 @@ class MicroDuckLivePassEnv(MicroDuckVolleyVisionEnv):
             target_source="rgb_paired_head_badges",
             target_geometry="live_physical_forehead",
             stage_separations=list(self.cfg.stage_separations),
+            stage_source_distance_limits=[
+                list(limits) if limits else None for limits in self.cfg.stage_source_distance_limits
+            ],
             root_jitter_m=[self.cfg.root_position_jitter, self.cfg.root_lateral_jitter],
             actor_information="independent89input14servoactors; no other-player proprioception",
             partner={

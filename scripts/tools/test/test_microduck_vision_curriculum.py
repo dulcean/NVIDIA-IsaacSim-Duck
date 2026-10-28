@@ -91,7 +91,8 @@ def test_visual_resume_keeps_its_pass_streak_and_rejects_teacher_or_changed_obje
     assert restored.state_dict() == original
 
 
-def test_incoming_visual_serves_are_physical_and_fully_visible_at_first_exposure():
+@pytest.mark.parametrize("live_partner", [False, True], ids=("legacy-coach", "live-pair"))
+def test_incoming_visual_serves_are_physical_and_fully_visible_at_first_exposure(live_partner):
     """A frontal source must survive gravity until the first real image, with its whole silhouette in view.
 
     The independent static FK fixture was calculated from the complete MicroDuck
@@ -99,7 +100,8 @@ def test_incoming_visual_serves_are_physical_and_fully_visible_at_first_exposure
     =.3491rad, other head/backlash angles zero, camera pupil (.0155,-.0000913778,
     -.083) and forehead (.035,0,-.07) in jaw_soft. Root-relative world offsets
     below are measured from that FK, not the serve/projection helpers. Receiver
-    roots use the current lesson separations .35/.40/.45m, with B rotated180°.
+    roots use each profile's lesson separations, with B rotated180°. The live
+    pair includes independent extrema of both robots' reset position jitter.
 
     This proves geometric startup at the worst .035s capture delay for the
     static reset pose. The real GPU sensor preflight separately verifies that
@@ -107,9 +109,13 @@ def test_incoming_visual_serves_are_physical_and_fully_visible_at_first_exposure
     """
     serves = importlib.import_module(f"{_PACKAGE}.ball_serves")
     gaze = importlib.import_module(f"{_PACKAGE}.active_vision")
-    receives, partners, pupils, quaternions, times, heights, fractions, offsets, source_offsets = ([] for _ in range(9))
-    root_half_gaps = (0.175, 0.200, 0.225, 0.225, 0.225, 0.225)
-    for spec, half_gap in zip(vision.VISION_STAGES, root_half_gaps):
+    live = importlib.import_module(f"{_PACKAGE}.live_pass_curriculum")
+    receives, partners, pupils, quaternions, times, heights, fractions, offsets, stage_indices = ([] for _ in range(9))
+    stages = live.VISION_STAGES if live_partner else vision.VISION_STAGES
+    separations = live.STAGE_SEPARATIONS if live_partner else (0.35, 0.40, 0.45, 0.45, 0.45, 0.45)
+    x_jitter = (-live.ROOT_POSITION_JITTER, live.ROOT_POSITION_JITTER) if live_partner else (0.0,)
+    y_jitter = (-live.ROOT_LATERAL_JITTER, live.ROOT_LATERAL_JITTER) if live_partner else (0.0,)
+    for stage, (spec, separation) in enumerate(zip(stages, separations)):
         extrema = itertools.product(
             spec.flight_time_range,
             (spec.source_height_min, spec.source_height_max),
@@ -117,12 +123,24 @@ def test_incoming_visual_serves_are_physical_and_fully_visible_at_first_exposure
             (-spec.serve_spread, spec.serve_spread),
             (-spec.serve_spread, spec.serve_spread),
             (-1, 1),
+            x_jitter,
+            x_jitter,
+            y_jitter,
+            y_jitter,
         )
-        for flight, height, lateral, offset_x, offset_y, side in extrema:
-            receiver = (side * (half_gap - 0.060997388), 0.0, 0.272598627)
+        for flight, height, lateral, offset_x, offset_y, side, receiver_x, partner_x, receiver_y, partner_y in extrema:
+            half_gap = separation / 2
+            receiver = (side * (half_gap - 0.060997388) + receiver_x, receiver_y, 0.272598627)
+            partner = (-side * (half_gap - 0.060997388) + partner_x, partner_y, receiver[2])
             receives.append(receiver)
-            partners.append((-receiver[0], 0.0, receiver[2]))
-            pupils.append((side * (half_gap - 0.073997382), side * 0.0000913795455, 0.253098626))
+            partners.append(partner)
+            pupils.append(
+                (
+                    side * (half_gap - 0.073997382) + receiver_x,
+                    side * 0.0000913795455 + receiver_y,
+                    0.253098626,
+                )
+            )
             quaternions.append(
                 (0.0, math.sqrt(0.5), 0.0, math.sqrt(0.5)) if side < 0 else (-math.sqrt(0.5), 0.0, math.sqrt(0.5), 0.0)
             )
@@ -130,11 +148,21 @@ def test_incoming_visual_serves_are_physical_and_fully_visible_at_first_exposure
             heights.append(height)
             fractions.append(lateral)
             offsets.append((offset_x, offset_y, 0.025))
-            source_offsets.append((-side * spec.source_distance, 0.0, 0.0))
-    receiver, partner, pupil, quaternion, flight, height, lateral, offset, source_offset = (
+            stage_indices.append(stage)
+    receiver, partner, pupil, quaternion, flight, height, lateral, offset = (
         torch.tensor(value, dtype=torch.float64)
-        for value in (receives, partners, pupils, quaternions, times, heights, fractions, offsets, source_offsets)
+        for value in (receives, partners, pupils, quaternions, times, heights, fractions, offsets)
     )
+    source_offset = torch.empty_like(receiver)
+    for stage, spec in enumerate(stages):
+        selected = torch.tensor(stage_indices) == stage
+        source_offset[selected] = serves.frontal_serve_source_offset(
+            receiver[selected],
+            partner[selected],
+            lateral[selected],
+            spec.source_distance,
+            distance_limits=live.STAGE_SOURCE_DISTANCE_LIMITS[stage] if live_partner else None,
+        )
     source, velocity, _, valid = serves.incoming_ballistic_serve(
         receiver, partner, flight, height, lateral, offset, source_offset=source_offset
     )

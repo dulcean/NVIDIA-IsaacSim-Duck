@@ -7,7 +7,14 @@
 
 from isaaclab.utils import configclass
 
-from .live_pass_curriculum import LIVE_PASS_PROFILE, VISION_STAGES
+from .live_pass_curriculum import (
+    LIVE_PASS_PROFILE,
+    ROOT_LATERAL_JITTER,
+    ROOT_POSITION_JITTER,
+    STAGE_SEPARATIONS,
+    STAGE_SOURCE_DISTANCE_LIMITS,
+    VISION_STAGES,
+)
 from .partner_marker_cfg import microduck_partner_marker_cfgs
 from .volley_vision_env_cfg import MicroDuckVolleyVisionEnvCfg, MicroDuckVolleyVisionSceneCfg
 
@@ -38,10 +45,11 @@ class MicroDuckLivePassEnvCfg(MicroDuckVolleyVisionEnvCfg):
     release_reward_scale = 2.0
     scene = MicroDuckLivePassSceneCfg(num_envs=128, env_spacing=2.0, lazy_sensor_update=True)
     curriculum_profile = LIVE_PASS_PROFILE
-    stage_separations = (0.45, 0.45, 0.45, 0.5, 0.55, 0.6)
+    stage_separations = STAGE_SEPARATIONS
     stage_serve_heights = tuple((spec.source_height_min, spec.source_height_max) for spec in VISION_STAGES)
     stage_source_distances = tuple(spec.source_distance for spec in VISION_STAGES)
+    stage_source_distance_limits = STAGE_SOURCE_DISTANCE_LIMITS
     partner_max_age: float = 0.75
     final_min_partner_visibility: float = 0.1
-    root_position_jitter: float = 0.04
-    root_lateral_jitter: float = 0.025
+    root_position_jitter: float = ROOT_POSITION_JITTER
+    root_lateral_jitter: float = ROOT_LATERAL_JITTER

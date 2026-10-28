@@ -51,11 +51,19 @@ a useful pass and excessive speed. No force or velocity command is applied to
 the ball. Kinematic arc feasibility does not prove that a head posture or motor
 can execute it; actual collision and balance learning still determine that.
 
-Robot positions vary at reset by up to 4 cm longitudinally and 2.5 cm laterally.
+Robot positions vary at reset by up to 4 cm longitudinally and 1 cm laterally.
 Both robots stay on court in every lesson. Targets follow actual head motion;
 the coach no longer parks the partner elsewhere. New physics uses authored ball
 `solref=(0.02,0.5)`, preserving the measured damped contact experiment rather than
 the previous high-speed rebound setting. This is not calibration to a real ball.
+
+In the 2/4/8-return lessons the incoming serve starts 0.75--0.80 m horizontally
+from the receiving forehead. This bounds the complete launch distance, including
+the sampled head-to-head gap; it is not an additional offset beyond the partner.
+The reset distribution must satisfy both the 3.5 m/s arrival-speed limit and
+full-ball visibility at the first camera exposure. The live sensor check uses
+a closer test sphere with a small initial toss to clear the physical partner
+while retaining two RGB exposures. All subsequent motion follows the simulation.
 
 ## Run on the NVIDIA machine
 
