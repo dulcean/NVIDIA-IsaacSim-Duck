@@ -1,5 +1,9 @@
 # MicroDuck head cameras and visual volleyball
 
+For the camera-only live partner profile, independent actors, physical passing
+gates and uninterrupted long runs, use [the live passing guide](microduck-live-pass.md).
+The coach-profile commands below retain their earlier lesson semantics.
+
 `IsaacContrib-Volley-Vision-MicroDuck` attaches actual RGB sensors to both moving heads.
 It uses the existing Newton/MJWarp physics and Viser. The actor's ball inputs come only
 from camera pixels; the critic retains simulator state during training. All 28 joint

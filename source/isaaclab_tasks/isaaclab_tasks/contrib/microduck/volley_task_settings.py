@@ -8,18 +8,29 @@
 import math
 
 
-def resolve_task_settings(metadata, *, damping_ratio=None, continuous=False, resume=False):
+def resolve_task_settings(metadata, *, damping_ratio=None, continuous=False, live_pass=False, resume=False):
     """Read legacy defaults or a validated checkpoint contract; reject changed full resumes."""
     settings = metadata.get(
         "task_settings", {"version": 1, "ball_solref": [0.02, 0.15], "continuous_launch_shaping": False}
     )
     if (
         not isinstance(settings, dict)
-        or set(settings) != {"version", "ball_solref", "continuous_launch_shaping"}
-        or type(settings["version"]) is not int
-        or settings["version"] != 1
-        or type(settings["continuous_launch_shaping"]) is not bool
+        or type(settings.get("version")) is not int
+        or settings.get("version") not in (1, 2)
+        or type(settings.get("continuous_launch_shaping")) is not bool
     ):
+        raise ValueError("Invalid saved volleyball task settings.")
+    expected = {"version", "ball_solref", "continuous_launch_shaping"}
+    if settings["version"] == 2:
+        expected |= {"live_pass", "release_reward_scale"}
+        if (
+            settings.get("live_pass") is not True
+            or type(settings.get("release_reward_scale")) not in (float, int)
+            or not math.isfinite(settings["release_reward_scale"])
+            or not 0 < settings["release_reward_scale"] <= 5
+        ):
+            raise ValueError("Invalid live-pass reward/contact settings.")
+    if set(settings) != expected:
         raise ValueError("Invalid saved volleyball task settings.")
     solref = settings["ball_solref"]
     if (
@@ -31,11 +42,16 @@ def resolve_task_settings(metadata, *, damping_ratio=None, continuous=False, res
         raise ValueError("Invalid saved ball solref.")
     saved = {**settings, "ball_solref": list(solref)}
     result = {**saved, "ball_solref": list(solref)}
+    if live_pass and settings["version"] == 1:
+        result.update(version=2, live_pass=True, release_reward_scale=2.0, continuous_launch_shaping=False)
+        result["ball_solref"][1] = 0.5
     if damping_ratio is not None:
         if not math.isfinite(damping_ratio) or not 0 < damping_ratio <= 1:
             raise ValueError("Ball damping ratio must be finite and in (0, 1].")
         result["ball_solref"][1] = damping_ratio
     result["continuous_launch_shaping"] |= continuous
+    if result.get("live_pass") and result["continuous_launch_shaping"]:
+        raise ValueError("Live passing uses its measured velocity objective, not the legacy release score.")
     if resume and result != saved:
         raise ValueError("Changed contacts or reward require --checkpoint for a fresh objective, not --resume.")
     return result
@@ -46,3 +62,5 @@ def apply_task_settings(cfg, settings):
     settings = resolve_task_settings({"task_settings": settings})
     cfg.scene.ball.spawn.collision_props[1].solref = tuple(settings["ball_solref"])
     cfg.continuous_launch_shaping = settings["continuous_launch_shaping"]
+    cfg.live_partner = settings.get("live_pass", False)
+    cfg.release_reward_scale = settings.get("release_reward_scale", 0.2)

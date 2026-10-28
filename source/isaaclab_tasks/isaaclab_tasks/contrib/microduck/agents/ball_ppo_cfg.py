@@ -70,3 +70,13 @@ class MicroDuckVolleyVisionPPORunnerCfg(MicroDuckVolleyCurriculumPPORunnerCfg):
 
     experiment_name = "microduck_volley_vision"
     obs_groups = {"actor": ["policy"], "critic": ["critic"]}
+
+
+@configclass
+class MicroDuckLivePassPPORunnerCfg(MicroDuckVolleyVisionPPORunnerCfg):
+    """Preserve the learned actor's hidden layers while training all pass-reference connections."""
+
+    experiment_name = "microduck_volley_live_pass"
+    actor = MicroDuckVolleyVisionPPORunnerCfg().actor.replace(
+        class_name="isaaclab_tasks.contrib.microduck.live_pass_actor:LocalPassActor"
+    )

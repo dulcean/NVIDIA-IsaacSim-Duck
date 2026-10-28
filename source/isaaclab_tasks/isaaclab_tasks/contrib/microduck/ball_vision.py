@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""RGB-only orange-ball estimates with calibrated monocular geometry and short tracking.
+"""RGB-only known-radius sphere estimates with calibrated geometry and short tracking.
 
 The pose rotates optical camera coordinates (+X right, +Y down, +Z forward)
 into world coordinates, using XYZW quaternions. No simulator state, depth,
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.nn.functional as F
@@ -27,7 +28,7 @@ class VisualBallTracks:
     """A snapshot: accepted pixels, recent prediction, or finite zero sentinels.
 
     ``visible`` means this update accepted an RGB measurement. ``valid`` also
-    allows a short world-frame ballistic prediction after a missing image.
+    allows a short world-frame kinematic prediction after a missing image.
     ``age`` is time since the last accepted measurement, in seconds. Expired or
     uninitialized tracks have zero position/velocity/confidence and valid=False.
     """
@@ -101,7 +102,12 @@ def visual_actor_observations(
 
 
 class BallVisualTracker:
-    """Find compact orange blobs and track a known-radius sphere in world coordinates."""
+    """Track a known-radius colored sphere from calibrated RGB in world coordinates.
+
+    Orange and gravity preserve the volleyball tracker. Head badges use separate
+    cyan/magenta masks and constant-velocity prediction; their state is never
+    initialized from the robot's simulated pose.
+    """
 
     def __init__(
         self,
@@ -117,6 +123,8 @@ class BallVisualTracker:
         velocity_smoothing: float = 0.5,
         distortion: tuple[float, float, float, float, float] = (0.0, 0.0, 0.0, 0.0, 0.0),
         max_candidates: int = 4,
+        color: Literal["orange", "cyan", "magenta"] = "orange",
+        acceleration: tuple[float, float, float] = (0.0, 0.0, -9.81),
     ):
         if type(num_envs) is not int or num_envs < 1 or type(max_candidates) is not int or max_candidates < 1:
             raise ValueError("Tracking requires a positive batch size and candidate count.")
@@ -127,6 +135,10 @@ class BallVisualTracker:
             raise ValueError("Tracking range, pixel radius, or velocity smoothing bounds are invalid.")
         if len(distortion) != 5 or not all(math.isfinite(value) for value in distortion):
             raise ValueError("OpenCV distortion must contain finite k1, k2, p1, p2, k3 coefficients.")
+        if color not in ("orange", "cyan", "magenta"):
+            raise ValueError("Sphere tracking color must be orange, cyan, or magenta.")
+        if len(acceleration) != 3 or not all(math.isfinite(value) for value in acceleration):
+            raise ValueError("Tracking acceleration must contain three finite world-frame components.")
         self.num_envs = num_envs
         self.device = torch.device(device)
         self.ball_radius = ball_radius
@@ -138,6 +150,7 @@ class BallVisualTracker:
         self.max_speed = max_speed
         self.velocity_smoothing = velocity_smoothing
         self.max_candidates = max_candidates
+        self.color = color
         self.distortion = torch.tensor(distortion, device=self.device, dtype=torch.float32)
         self.device = self.distortion.device
         self.position_w = torch.zeros(num_envs, 3, device=self.device)
@@ -150,7 +163,7 @@ class BallVisualTracker:
         self.last_seen_position_w = torch.zeros_like(self.position_w)
         self.seen = torch.zeros_like(self.visible)
         self._measurement_confidence = torch.zeros_like(self.age)
-        self._acceleration = self.position_w.new_tensor((0.0, 0.0, -9.81))
+        self._acceleration = self.position_w.new_tensor(acceleration)
         self._pixel_cache = {}
 
     def reset(self, env_ids=None):
@@ -209,8 +222,15 @@ class BallVisualTracker:
         red, green, blue = pixels.unbind(-1)
         # Ratios retain the shaded hemisphere seen in actual Newton camera frames.
         # Absolute brightness alone removed half the ball and corrupted monocular size/range.
-        mask = (red >= 45) & (green >= 15) & (red - green >= 15)
-        mask &= (red >= 1.30 * green) & (green >= 1.5 * blue + 4)
+        if self.color == "orange":
+            mask = (red >= 45) & (green >= 15) & (red - green >= 15)
+            mask &= (red >= 1.30 * green) & (green >= 1.5 * blue + 4)
+        elif self.color == "cyan":
+            mask = (green >= 30) & (blue >= 35) & (green >= 1.5 * red + 8) & (blue >= 1.8 * red + 8)
+            mask &= (green >= 0.65 * blue) & (blue >= 0.65 * green)
+        else:
+            mask = (red >= 35) & (blue >= 30) & (red >= 1.8 * green + 8) & (blue >= 1.5 * green + 8)
+            mask &= (red >= 0.65 * blue) & (blue >= 0.65 * red)
         labels = template.expand(self.num_envs, -1, -1) * mask
         for _ in range(math.ceil(math.log2(height * width)) + 2):
             labels = F.max_pool2d(labels.unsqueeze(1), 3, stride=1, padding=1).squeeze(1) * mask

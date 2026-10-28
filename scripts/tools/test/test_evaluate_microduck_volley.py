@@ -260,3 +260,63 @@ def test_final_visual_episode_uses_the_declared_visibility_threshold_for_each_pl
     )
     assert report.successes_by_side == (1, 1) and report.objective == "rally"
     assert metrics["final_min_gaze_visibility"] == 0.60
+
+
+def test_live_pass_graduation_requires_real_transfers_and_both_ball_and_partner_rgb_evidence():
+    """The live profile cannot reuse virtual coach successes or certify blind eight-return rallies."""
+    contract = evaluation._curriculum_module(evaluation.LIVE_PASS_PROFILE)
+    records = [
+        {
+            **episode(side, stage=2),
+            "objective": "rally",
+            "partner_visible_a": 0.5,
+            "partner_visible_b": 0.5,
+            "partner_seen_a": 1,
+            "partner_seen_b": 1,
+        }
+        for side in (0, 1)
+    ]
+    source = EpisodeSource(2, {1: records}, profile=evaluation.LIVE_PASS_PROFILE)
+    source.cfg.curriculum_stage = 2
+    policy = DeterministicPolicy()
+    with pytest.raises(ValueError, match="too-short rally"):
+        evaluation.evaluate_policy(source, policy, stage=2, evaluation_id=0, episodes_per_side=1)
+    for record in records:
+        record["returns"] = 1
+    report, metrics = evaluation.evaluate_policy(source, policy, stage=2, evaluation_id=1, episodes_per_side=1)
+    state = evaluation._state_type(contract)(stage=2, min_attempts_per_side=1)
+    assert isinstance(state, contract.LivePassCurriculumState)
+    assert state.stages[2].paired and report.required_returns == 1
+    assert report.successes_by_side == (1, 1) and state.update_evaluation(report).status == "passed"
+    assert metrics["profile"] == evaluation.LIVE_PASS_PROFILE
+
+    final = {
+        **episode(0, stage=5),
+        "returns": 8,
+        "objective": "rally",
+        "gaze_visible_a": 0.60,
+        "gaze_visible_b": 0.75,
+        "partner_visible_a": 0.10,
+        "partner_visible_b": 0.20,
+        "partner_seen_a": 1,
+        "partner_seen_b": 1,
+    }
+    source = EpisodeSource(2, {1: [final, {**final, "env_id": 1, "server": 1}]}, evaluation.LIVE_PASS_PROFILE)
+    source.cfg.curriculum_stage = 5
+    source.cfg.final_min_gaze_visibility = 0.60
+    source.cfg.final_min_partner_visibility = 0.10
+    for override in (
+        {"returns": 7},
+        {"gaze_visible_a": 0.59},
+        {"partner_visible_a": 0.09},
+        {"partner_seen_b": 0},
+        {"partner_seen_a": None},
+    ):
+        source.schedule[1][0] = {**final, **override}
+        with pytest.raises(ValueError, match="rally|visibility|partner"):
+            evaluation.evaluate_policy(source, policy, stage=5, evaluation_id=2, episodes_per_side=1)
+    source.schedule[1][0] = final
+    report, _ = evaluation.evaluate_policy(source, policy, stage=5, evaluation_id=3, episodes_per_side=1)
+    state = evaluation._state_type(contract)(stage=5, min_attempts_per_side=1)
+    assert report.successes_by_side == (1, 1) and report.required_returns == 8
+    assert state.update_evaluation(report).status == "passed"

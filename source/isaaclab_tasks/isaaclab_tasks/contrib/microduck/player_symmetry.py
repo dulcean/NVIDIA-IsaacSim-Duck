@@ -27,12 +27,17 @@ def exchange_players(env, obs=None, actions=None):
     The same rotation exchanges the first receiver and the partner implicitly
     through their local turn/phase/state features. The environment is unused.
     """
+    return _exchange_players(obs, actions, policy_width=76)
+
+
+def _exchange_players(obs, actions, *, policy_width):
+    """Share the physical identity exchange for both visual observation contracts."""
     augmented_obs = None
     augmented_actions = None
     if obs is not None:
         if len(obs.batch_size) != 1:
             raise ValueError("Player exchange requires a flat PPO observation batch.")
-        widths = {"policy": 76, "critic": 71}
+        widths = {"policy": policy_width, "critic": 71}
         if not obs.keys() or any(name not in widths for name in obs.keys()):
             raise ValueError("Player exchange supports only visual policy and privileged critic groups.")
         exchanged = {}

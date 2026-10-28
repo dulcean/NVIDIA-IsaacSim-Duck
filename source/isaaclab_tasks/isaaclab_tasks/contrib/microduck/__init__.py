@@ -66,3 +66,13 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{__name__}.agents.ball_ppo_cfg:MicroDuckVolleyVisionPPORunnerCfg",
     },
 )
+
+gym.register(
+    id="IsaacContrib-Volley-LivePass-MicroDuck",
+    entry_point=f"{__name__}.volley_live_pass_env:MicroDuckLivePassEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.volley_live_pass_env_cfg:MicroDuckLivePassEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{__name__}.agents.ball_ppo_cfg:MicroDuckLivePassPPORunnerCfg",
+    },
+)

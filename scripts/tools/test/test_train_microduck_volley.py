@@ -89,6 +89,43 @@ def test_watch_selection_bins_partial_progress_without_overriding_one_real_succe
     )
 
 
+def test_long_run_keeps_stalled_gate_and_optimizer_attempts_until_real_passes():
+    """More than two stall windows cannot force rollback, promotion or successful completion."""
+    contract = driver._tool("evaluate_microduck_volley")._curriculum_module("microduck_volley_vision_v2")
+    state = contract.VisionCurriculumState(stage=2)
+    policy = driver.resolve_run_policy({}, True)
+    for evaluation_id in range(10):
+        report = contract.VisionEvaluationReport(evaluation_id, 2, 0, (64, 64), (0, 0), 0, objective="aim_return")
+        decision = state.update_evaluation(report)
+        if evaluation_id >= 3:
+            assert decision.status == "stalled"
+            record = driver.evaluation_decision_record(decision, policy, candidate=None, already_restored=False)
+            assert record["status"] == "stalled" and record["training_action"] == "continue"
+        assert state.stage == 2 and not state.complete and state.consecutive_passes == 0
+    assert state.failed_evaluations == 10
+    restored = contract.VisionCurriculumState(stage=2)
+    restored.load_state_dict(state.state_dict())
+    for evaluation_id in (10, 11):
+        decision = restored.update_evaluation(
+            contract.VisionEvaluationReport(evaluation_id, 2, 0, (64, 64), (60, 60), 0, objective="aim_return")
+        )
+    assert decision.status == "advanced" and restored.stage == 3 and not restored.complete
+
+
+def test_long_run_policy_survives_resume_with_an_explicit_bounded_override():
+    """A resume cannot silently restore the old stopping behavior or claim malformed policy metadata."""
+    enabled = driver.resolve_run_policy({}, True)
+    metadata = {"run_policy": enabled}
+    assert driver.resolve_run_policy(metadata) == enabled
+    bounded = driver.resolve_run_policy(metadata, False)
+    assert metadata["run_policy"] == enabled
+    assert driver.stalled_training_action(bounded, best_available=True, already_restored=False) == "restore"
+    assert driver.stalled_training_action(bounded, best_available=True, already_restored=True) == "stop"
+    assert driver.resolve_run_policy({}, default=True) == enabled
+    with pytest.raises(ValueError, match="run policy"):
+        driver.resolve_run_policy({"run_policy": {"version": 1, "keep_training_on_stall": "false"}})
+
+
 def test_full_resume_accepts_complete_state_without_mutating_it(resumable_checkpoint):
     """Loading progress validates the stored contract while retaining its metadata."""
     metadata = resumable_checkpoint["infos"]["microduck_curriculum"]
@@ -133,6 +170,25 @@ def test_native_visual_warm_start_keeps_actions_without_importing_old_objective_
         driver.resume_metadata(warm, prepare.VISION_PROFILE)
     warm["actor_state_dict"]["mlp.0.bias"].add_(1)
     assert not torch.equal(warm["actor_state_dict"]["mlp.0.bias"], source["actor_state_dict"]["mlp.0.bias"])
+
+
+def test_standalone_prepared_live_actor_retains_source_camera_validation_on_warm_start(resumable_checkpoint):
+    """A prepared file or saved initial.pt must be usable without inventing a native camera contract."""
+    visual = driver._tool("prepare_microduck_vision_checkpoint").prepare_vision_checkpoint(resumable_checkpoint)
+    visual["infos"]["microduck_curriculum"]["vision_contract"] = {"version": 3, "actor_width": 152}
+    adapter = driver._tool("prepare_microduck_live_pass_checkpoint")
+    prepared = adapter.prepare_live_pass_checkpoint(visual)
+    warm = driver.prepare_starting_checkpoint(prepared, adapter.LIVE_PASS_PROFILE, adapter.prepare_live_pass_checkpoint)
+    metadata = warm["infos"]["microduck_curriculum"]
+    assert metadata["expanded_visual_warm_start"] is True
+    assert metadata["source_vision_contract"] == {"version": 3, "actor_width": 152}
+    assert "vision_contract" not in metadata
+    assert not {"critic_state_dict", "optimizer_state_dict", "iter"}.intersection(warm)
+    with pytest.raises(ValueError, match="warm start"):
+        driver.resume_metadata(warm, adapter.LIVE_PASS_PROFILE)
+    prepared["infos"]["microduck_curriculum"]["source_profile"] = "unrelated_visual_task"
+    with pytest.raises(ValueError, match="source provenance"):
+        driver.prepare_starting_checkpoint(prepared, adapter.LIVE_PASS_PROFILE, adapter.prepare_live_pass_checkpoint)
 
 
 def test_player_symmetry_activation_and_resume_do_not_silently_disable_learning_method():

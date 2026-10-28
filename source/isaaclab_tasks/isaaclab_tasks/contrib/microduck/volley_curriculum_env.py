@@ -102,6 +102,27 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
     def _receivers(self):
         return self._targets if hasattr(self, "_targets") else super()._receivers()
 
+    def _refresh_targets(self):
+        """Optional live-target update; legacy coach targets remain fixed."""
+
+    def _arrange_players(self, env_ids):
+        """Optional reset-only distribution; no in-flight body placement."""
+
+    def _new_strike_reference(self, player, hit):
+        """Capture an optional physical pass reference without controlling the collision."""
+
+    def _release_shaping(self, player, ball, quality):
+        if not self.cfg.continuous_launch_shaping:
+            return quality
+        return launch_progress(
+            ball,
+            self._ball.data.root_link_lin_vel_w.torch,
+            self._targets[:, player],
+            self.cfg.target_radius,
+            self.cfg.minimum_flight_time,
+            self._launch_age[:, player],
+        )
+
     def _pre_physics_step(self, actions):
         super()._pre_physics_step(actions)
         self.extras["episode_records"] = []
@@ -111,6 +132,7 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
         self._own_hit_age += self.step_dt
 
     def _update_contacts(self):
+        self._refresh_targets()
         dt = self.cfg.sim.dt
         active = self._episode.phase == 0
         self._post_rally.active.copy_(~active)
@@ -142,6 +164,7 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
                 self._qualified_returns += qualified.float()
             else:
                 self._game_invalid |= hit & ((self._server != player) | (old_hitter >= 0))
+            self._new_strike_reference(player, hit)
             self._own_hit_age[hit, player] = 0
             self._launch_pending[hit, player] = True
             self._launch_age[hit, player] = 0
@@ -162,18 +185,7 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
                 elapsed_flight=self._launch_age[:, player],
             )
             credit = quality * (ready[:, player] & active).float()
-            progress = (
-                launch_progress(
-                    ball,
-                    self._ball.data.root_link_lin_vel_w.torch,
-                    self._targets[:, player],
-                    self.cfg.target_radius,
-                    self.cfg.minimum_flight_time,
-                    self._launch_age[:, player],
-                )
-                if self.cfg.continuous_launch_shaping
-                else quality
-            )
+            progress = self._release_shaping(player, ball, quality)
             self._release_event += progress * (ready[:, player] & active).float()
             self._launch_total += credit
         self._launch_pending &= ~ready
@@ -313,7 +325,7 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
         reward = (
             self._qualified_event
             + 0.05 * self._hit_event
-            + 0.2 * self._release_event
+            + self.cfg.release_reward_scale * self._release_event
             + 3.0 * self._episode.success.float()
             + improvement
             + (0.1 * stable.float().mean(-1) - 0.01 * rate) * self.step_dt
@@ -324,6 +336,7 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
         return torch.nan_to_num(reward, nan=-3.0, posinf=-3.0, neginf=-3.0)
 
     def _get_observations(self):
+        self._refresh_targets()
         blocks = super()._get_observations()["policy"].view(self.num_envs, 2, 71).clone()
         for player, robot in enumerate(self._robots):
             data = robot.data
@@ -441,6 +454,7 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
                     )
         self.cfg.separation = self.cfg.stage_separations[self.stage]
         super()._reset_idx(env_ids)
+        self._arrange_players(env_ids)
         self.extras.setdefault("episode_records", []).extend(records)
         if records:
             self.extras["log"] = {
@@ -494,7 +508,7 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
         count = len(env_ids)
         self._server[env_ids] = env_ids.long() % 2 if self.evaluation else (self._uniform(count, 0, 1) >= 0.5).long()
         spec = self.stages[self.stage]
-        if not spec.paired:
+        if not spec.paired and not self.cfg.live_partner:
             for player, robot in enumerate(self._robots):
                 pose = robot.data.root_link_pose_w.torch[env_ids].clone()
                 parked = self._server[env_ids] != player
@@ -510,9 +524,11 @@ class MicroDuckVolleyCurriculumEnv(MicroDuckBallEnv):
         self._targets[env_ids] = self._head_positions()[env_ids].flip(1)
         self._targets[env_ids, :, 2] += self.cfg.ball_radius
         receiving = self._head_positions()[env_ids, self._server[env_ids]]
-        partner = receiving.clone()
-        partner[:, 0] = 2 * self.scene.env_origins[env_ids, 0] - receiving[:, 0]
-        if not spec.paired:
+        partner = self._head_positions()[env_ids, 1 - self._server[env_ids]].clone()
+        if not self.cfg.live_partner:
+            partner = receiving.clone()
+            partner[:, 0] = 2 * self.scene.env_origins[env_ids, 0] - receiving[:, 0]
+        if not spec.paired and not self.cfg.live_partner:
             target = partner.clone()
             target[:, 2] += self.cfg.ball_radius
             self._targets[env_ids, self._server[env_ids]] = target

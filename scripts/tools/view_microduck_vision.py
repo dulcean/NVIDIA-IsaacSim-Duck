@@ -45,38 +45,44 @@ def preview(args) -> dict:
 
     from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
-    from isaaclab_tasks.contrib.microduck.agents.ball_ppo_cfg import MicroDuckVolleyVisionPPORunnerCfg
     from isaaclab_tasks.contrib.microduck.volley_task_settings import apply_task_settings, resolve_task_settings
-    from isaaclab_tasks.contrib.microduck.volley_vision_env import MicroDuckVolleyVisionEnv
-    from isaaclab_tasks.contrib.microduck.volley_vision_env_cfg import MicroDuckVolleyVisionEnvCfg
 
-    converter = _tool("prepare_microduck_vision_checkpoint")
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     metadata = (checkpoint.get("infos") or {}).get("microduck_curriculum", {})
     source_profile = metadata.get("profile", "legacy_state_actor")
-    converted = metadata.get("profile") != converter.VISION_PROFILE
+    live_pass = source_profile == "microduck_volley_live_pass_v1"
+    if args.play:
+        if not live_pass:
+            raise ValueError("--play requires a native live-pass checkpoint.")
+        args.stage = 5
+    EnvCfg, Environment, AgentCfg, prepare_weights, profile, _, State = _tool(
+        "train_microduck_volley"
+    )._task_components(True, live_pass)
+    converted = source_profile != profile
     if converted:
-        checkpoint = converter.prepare_vision_checkpoint(checkpoint)
-    vision_contract = _tool("evaluate_microduck_volley")._curriculum_module(converter.VISION_PROFILE)
-    lesson = vision_contract.VISION_STAGES[args.stage]
+        checkpoint = prepare_weights(checkpoint)
+    lesson = State.stages[args.stage]
     actor = checkpoint.get("actor_state_dict")
     if not isinstance(actor, dict) or any(
         not isinstance(value, torch.Tensor) or not torch.isfinite(value).all() for value in actor.values()
     ):
         raise ValueError("The preview requires a finite actor state dictionary.")
     torch.manual_seed(args.seed)
-    cfg = MicroDuckVolleyVisionEnvCfg()
-    task_settings = resolve_task_settings(metadata)
+    cfg = EnvCfg()
+    task_settings = resolve_task_settings(metadata, live_pass=live_pass)
     apply_task_settings(cfg, task_settings)
     cfg.scene.num_envs = args.num_envs
     cfg.sim.device = args.device
     cfg.curriculum_stage = args.stage
     cfg.seed = args.seed
+    if args.play:
+        cfg.play_returns = 1_000_000
+        cfg.episode_length_s = 60.0
     cfg.head_camera_panels = not args.no_head_panels
     cfg.head_camera_panel_fps = args.panel_fps
     if args.viz == "none":
         cfg.sim.visualizer_cfgs = []
-    agent = MicroDuckVolleyVisionPPORunnerCfg()
+    agent = AgentCfg()
     agent.device = args.device
     agent.seed = args.seed
     args.output.mkdir(parents=True, exist_ok=True)
@@ -92,6 +98,10 @@ def preview(args) -> dict:
         if converted
         else "No checkpoint conversion.",
         "stage": args.stage,
+        "mode": "gameplay" if args.play else "heldout_stage_preview",
+        "rollout_scope": "Interactive continuing rallies; certification remains a separate held-out evaluation."
+        if args.play
+        else "Preview of the selected held-out lesson; no skill certification is performed.",
         "stage_name": lesson.name,
         "objective": lesson.objective,
         "num_envs": args.num_envs,
@@ -100,13 +110,15 @@ def preview(args) -> dict:
         "head_panels_enabled": cfg.head_camera_panels,
         "head_panel_fps": args.panel_fps,
         "status": "initializing",
-        "actor_observation_width": converter.ACTOR_WIDTH,
+        "actor_observation_width": actor["mlp.0.weight"].shape[1],
         "critic_observation_width": 142,
         "display_rotation": "90 degrees clockwise; original camera pixels feed the tracker",
         "runtime_passed": False,
         "skill_assessed": False,
         "ground_truth_use": (
-            "Critic, task/reward labels and diagnostics; actor ball state and search memory come only from RGB."
+            "Critic, task/reward labels and diagnostics; actor ball, partner and search memory come only from RGB."
+            if live_pass
+            else "Critic, task/reward labels and diagnostics; actor ball state and search memory come only from RGB."
         ),
     }
     phases = {name: 0.0 for name in ("policy", "environment_step", "diagnostics", "artifacts", "pacing_wait")}
@@ -119,13 +131,15 @@ def preview(args) -> dict:
         {"device": args.device, "visualizer": [args.viz], "max_visible_envs": min(args.num_envs, 4)},
     ):
         sim_utils.create_new_stage()
-        env = MicroDuckVolleyVisionEnv(cfg)
+        env = Environment(cfg)
         try:
             contract = env.vision_contract()
-            if not converted and "vision_contract" in metadata and metadata["vision_contract"] != contract:
+            if live_pass:
+                env.validate_source_contract(metadata)
+            elif not converted and "vision_contract" in metadata and metadata["vision_contract"] != contract:
                 raise ValueError("Saved visual observation/camera contract differs from this environment.")
             report["vision_contract"] = contract
-            env.set_evaluation(True, seed=args.seed)
+            env.set_evaluation(not args.play, seed=args.seed)
             wrapped = RslRlVecEnvWrapper(env, clip_actions=agent.clip_actions)
             runner = OnPolicyRunner(wrapped, to_dict(agent), log_dir=None, device=args.device)
             policy = runner.get_inference_policy(device=args.device)
@@ -277,6 +291,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--stage", type=int, choices=range(6), default=0)
+    parser.add_argument(
+        "--play", action="store_true", help="Continue native live-pass rallies until a miss or 60-second reset."
+    )
     parser.add_argument("--num-envs", type=int, default=4)
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--output", type=Path, default=Path("logs/microduck_vision_preview"))

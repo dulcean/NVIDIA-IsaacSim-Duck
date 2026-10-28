@@ -37,3 +37,19 @@ def test_contact_and_reward_settings_survive_serialization_and_guard_full_resume
     saved["task_settings"]["ball_solref"][1] = float("nan")
     with pytest.raises(ValueError, match="solref"):
         settings.resolve_task_settings(saved)
+
+
+def test_live_objective_migration_is_explicit_and_stays_live_after_resume():
+    """New physical/reward settings cannot be dropped when CLI options are omitted later."""
+    source = {"task_settings": settings.resolve_task_settings({}, continuous=True)}
+    migrated = settings.resolve_task_settings(source, live_pass=True)
+    saved = json.loads(json.dumps({"task_settings": migrated}))
+    assert settings.resolve_task_settings(saved, resume=True, live_pass=True) == migrated
+    assert settings.resolve_task_settings(saved) == migrated
+    assert migrated["live_pass"] and not migrated["continuous_launch_shaping"]
+    assert migrated["release_reward_scale"] > 0.2
+    assert source["task_settings"]["continuous_launch_shaping"]
+    with pytest.raises(ValueError, match="fresh objective"):
+        settings.resolve_task_settings(source, live_pass=True, resume=True)
+    with pytest.raises(ValueError, match="legacy release"):
+        settings.resolve_task_settings(saved, continuous=True)

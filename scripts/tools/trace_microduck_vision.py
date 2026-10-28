@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib
 import json
 import math
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -155,6 +157,25 @@ def summarize_flights(rows, records, *, release_delay=0.02, minimum_flight=0.16)
     }
 
 
+def _live_partner_trace_fields(env, player, side):
+    """Keep raw RGB partner estimates and the privileged reward reference separately labeled."""
+    partner = env.partner_tracks[player]
+    fields = {
+        f"partner_rgb_visible_{side}": partner.visible,
+        f"partner_rgb_valid_{side}": partner.valid,
+        f"partner_rgb_age_{side}": partner.age,
+        f"reference_valid_{side}": env._reference_valid[:, player],
+    }
+    for prefix, tensor in (
+        ("partner_rgb", partner.position_w - env.scene.env_origins),
+        ("partner_rgb_velocity", partner.velocity_w),
+        ("desired_release", env._desired_release[:, player]),
+    ):
+        for index, axis in enumerate("xyz"):
+            fields[f"{prefix}_{side}_{axis}"] = tensor[:, index]
+    return fields
+
+
 def collect(args):
     """Collect balanced first-episode cohorts from two actual camera/physics worlds."""
     import torch
@@ -168,22 +189,26 @@ def collect(args):
 
     from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
-    from isaaclab_tasks.contrib.microduck.agents.ball_ppo_cfg import MicroDuckVolleyVisionPPORunnerCfg
     from isaaclab_tasks.contrib.microduck.volley_task_settings import apply_task_settings, resolve_task_settings
-    from isaaclab_tasks.contrib.microduck.volley_vision_env import MicroDuckVolleyVisionEnv
-    from isaaclab_tasks.contrib.microduck.volley_vision_env_cfg import MicroDuckVolleyVisionEnvCfg
 
     checkpoint = torch.load(args.checkpoint, weights_only=True, map_location="cpu")
     metadata = (checkpoint.get("infos") or {}).get("microduck_curriculum", {})
-    if metadata.get("profile") != "microduck_volley_vision_v2":
-        raise ValueError("Trace requires actual vision-v2 weights, without checkpoint adaptation.")
+    profile = metadata.get("profile")
+    if profile not in ("microduck_volley_vision_v2", "microduck_volley_live_pass_v1"):
+        raise ValueError("Trace requires native vision-v2 or live-pass weights, without checkpoint adaptation.")
+    live_pass = profile == "microduck_volley_live_pass_v1"
+    root = str(Path(__file__).resolve().parents[2])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    components = importlib.import_module("scripts.tools.train_microduck_volley")._task_components(True, live_pass)
+    EnvCfg, Environment, AgentCfg = components[:3]
     actor = checkpoint.get("actor_state_dict")
     if not isinstance(actor, dict) or any(
         not isinstance(value, torch.Tensor) or not torch.isfinite(value).all() for value in actor.values()
     ):
         raise ValueError("Trace requires a finite actor state dictionary.")
-    cfg = MicroDuckVolleyVisionEnvCfg()
-    task_settings = resolve_task_settings(metadata, damping_ratio=args.ball_damping_ratio)
+    cfg = EnvCfg()
+    task_settings = resolve_task_settings(metadata, damping_ratio=args.ball_damping_ratio, live_pass=live_pass)
     apply_task_settings(cfg, task_settings)
     cfg.scene.num_envs = 2
     cfg.sim.device = args.device
@@ -194,7 +219,7 @@ def collect(args):
     collision = cfg.scene.ball.spawn.collision_props[1]
     rows, records = [], []
 
-    class TracedVision(MicroDuckVolleyVisionEnv):
+    class TracedVision(Environment):
         """Observe the real production hooks, including the final pre-reset state."""
 
         trace_keys = None
@@ -243,6 +268,8 @@ def collect(args):
                 fields[f"rgb_visible_{side}"] = tracker.visible
                 fields[f"rgb_valid_{side}"] = tracker.valid
                 fields[f"rgb_age_{side}"] = tracker.age
+                if live_pass:
+                    fields.update(_live_partner_trace_fields(self, player, side))
             fields["raw_head_onsets"] = torch.zeros_like(self._hits) if onsets is None else onsets
             fields["world"] = torch.arange(2, device=self.device)
             fields["episode"] = self._episode_ids
@@ -271,13 +298,15 @@ def collect(args):
             self.snapshot("terminal")
             return reward
 
-    agent = MicroDuckVolleyVisionPPORunnerCfg()
+    agent = AgentCfg()
     agent.device = args.device
     with launch_simulation(cfg.sim, {"device": args.device, "visualizer": ["none"]}):
         sim_utils.create_new_stage()
         env = TracedVision(cfg)
         try:
-            if metadata.get("vision_contract") != env.vision_contract():
+            if live_pass:
+                env.validate_source_contract(metadata)
+            elif metadata.get("vision_contract") != env.vision_contract():
                 raise ValueError("Checkpoint and current camera/task contracts differ.")
             env.set_evaluation(True, seed=args.seed)
             wrapped = RslRlVecEnvWrapper(env, clip_actions=agent.clip_actions)
@@ -313,6 +342,7 @@ def collect(args):
                     "steps": steps,
                     "complete": len(records) == 2 * args.episodes_per_side,
                     "checkpoint_iteration": checkpoint.get("iter"),
+                    "checkpoint_profile": profile,
                     "stage": args.stage,
                     "objective": env.stages[args.stage].objective,
                     "physics_dt_s": cfg.sim.dt,
@@ -324,6 +354,7 @@ def collect(args):
                     "task_settings": task_settings,
                     "contact_experiment": args.ball_damping_ratio is not None,
                     "training_performed": False,
+                    "vision": env.vision_diagnostics(),
                 },
             )
         finally:

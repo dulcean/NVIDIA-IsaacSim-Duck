@@ -23,6 +23,7 @@ from pathlib import Path
 CURRICULUM_PROFILE = "microduck_volley_curriculum_v1"
 VISION_PROFILE = "microduck_volley_vision_v2"
 LEGACY_VISION_PROFILE = "microduck_volley_vision_v1"
+LIVE_PASS_PROFILE = "microduck_volley_live_pass_v1"
 
 
 def _curriculum_module(profile=CURRICULUM_PROFILE):
@@ -32,6 +33,9 @@ def _curriculum_module(profile=CURRICULUM_PROFILE):
     elif profile == VISION_PROFILE:
         _curriculum_module(CURRICULUM_PROFILE)
         filename = "vision_curriculum"
+    elif profile == LIVE_PASS_PROFILE:
+        _curriculum_module(VISION_PROFILE)
+        filename = "live_pass_curriculum"
     else:
         raise ValueError("Unknown curriculum profile; legacy vision checkpoints need a fresh v2 warm start.")
     name = f"isaaclab_tasks.contrib.microduck.{filename}"
@@ -56,10 +60,12 @@ def _stage_specs(module):
 
 def _state_type(module):
     """Use the state validator that owns the selected physical/visual objective."""
+    if hasattr(module, "LivePassCurriculumState"):
+        return module.LivePassCurriculumState
     return module.VisionCurriculumState if hasattr(module, "VisionCurriculumState") else module.CurriculumState
 
 
-def _validate_record(record: dict, stage: int, spec, min_gaze_visibility=None):
+def _validate_record(record: dict, stage: int, spec, min_gaze_visibility=None, min_partner_visibility=None):
     """Fail closed if rollout metadata cannot prove the advertised objective."""
     fields = ("env_id", "episode_id", "server", "returns", "stage")
     if any(type(record.get(name)) is not int or record[name] < 0 for name in fields):
@@ -74,6 +80,7 @@ def _validate_record(record: dict, stage: int, spec, min_gaze_visibility=None):
         raise ValueError("Episode success and unsafe outcomes must be booleans.")
     if record["success"] and (record["unsafe"] or record["returns"] < spec.required_returns):
         raise ValueError("An unsafe or too-short rally cannot be a successful held-out episode.")
+    _validate_partner_evidence(record, min_partner_visibility)
     if not isinstance(record.get("reason"), str):
         raise ValueError("Episode records must include a terminal reason.")
     if "goal_reached" in record and type(record["goal_reached"]) is not bool:
@@ -122,6 +129,20 @@ def _validate_record(record: dict, stage: int, spec, min_gaze_visibility=None):
             raise ValueError("Final visual success does not meet both players' measured visibility requirement.")
 
 
+def _validate_partner_evidence(record, minimum):
+    """Keep live partner qualification independent from predicted arc scores."""
+    if minimum is None:
+        return
+    rates = [record.get(f"partner_visible_{side}") for side in ("a", "b")]
+    seen = [record.get(f"partner_seen_{side}") for side in ("a", "b")]
+    if any(type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1 for value in rates):
+        raise ValueError("Live-pass qualification needs two measured partner visibility rates.")
+    if any(value not in (0, 1) for value in seen):
+        raise ValueError("Live-pass qualification needs RGB partner-acquisition evidence.")
+    if record["success"] and (min(rates) < minimum or not all(seen)):
+        raise ValueError("A claimed live rally lacks measured partner tracking.")
+
+
 def evaluate_policy(
     env,
     policy,
@@ -162,6 +183,7 @@ def evaluate_policy(
         raise ValueError("Balanced evaluation requires at least two parallel worlds.")
     spec = stages[stage]
     minimum_visibility = None
+    partner_visibility = 0.0 if profile == LIVE_PASS_PROFILE and stage >= 2 else None
     if hasattr(spec, "objective") and stage == len(stages) - 1:
         minimum_visibility = getattr(raw.cfg, "final_min_gaze_visibility", 0.60)
         if (
@@ -170,6 +192,8 @@ def evaluate_policy(
             or not 0 <= minimum_visibility <= 1
         ):
             raise ValueError("Final visual visibility qualification must be a finite rate between zero and one.")
+        if profile == LIVE_PASS_PROFILE:
+            partner_visibility = raw.cfg.final_min_partner_visibility
     attempts = [0, 0]
     successes = [0, 0]
     records = []
@@ -198,7 +222,13 @@ def evaluate_policy(
                     if hasattr(policy, "reset"):
                         policy.reset(dones)
                     for record in extras.pop("episode_records", []):
-                        _validate_record(record, stage, spec, min_gaze_visibility=minimum_visibility)
+                        _validate_record(
+                            record,
+                            stage,
+                            spec,
+                            min_gaze_visibility=minimum_visibility,
+                            min_partner_visibility=partner_visibility,
+                        )
                         world = record["env_id"]
                         if world not in remaining:
                             continue
@@ -330,7 +360,7 @@ def collect(args: argparse.Namespace) -> dict:
             "Vision-v1 checkpoints require prepare_microduck_vision_checkpoint.py before v2 evaluation; "
             "the new visual objectives and 152-value actor are a fresh warm start."
         )
-    if profile not in (CURRICULUM_PROFILE, VISION_PROFILE):
+    if profile not in (CURRICULUM_PROFILE, VISION_PROFILE, LIVE_PASS_PROFILE):
         raise ValueError("Convert the source checkpoint for the curriculum or vision task first.")
     stage = args.stage
     if stage is None:
@@ -346,7 +376,11 @@ def collect(args: argparse.Namespace) -> dict:
 
     from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
-    if profile == VISION_PROFILE:
+    if profile == LIVE_PASS_PROFILE:
+        from isaaclab_tasks.contrib.microduck.agents.ball_ppo_cfg import MicroDuckLivePassPPORunnerCfg as AgentCfg
+        from isaaclab_tasks.contrib.microduck.volley_live_pass_env import MicroDuckLivePassEnv as Environment
+        from isaaclab_tasks.contrib.microduck.volley_live_pass_env_cfg import MicroDuckLivePassEnvCfg as EnvCfg
+    elif profile == VISION_PROFILE:
         from isaaclab_tasks.contrib.microduck.agents.ball_ppo_cfg import MicroDuckVolleyVisionPPORunnerCfg as AgentCfg
         from isaaclab_tasks.contrib.microduck.volley_vision_env import MicroDuckVolleyVisionEnv as Environment
         from isaaclab_tasks.contrib.microduck.volley_vision_env_cfg import MicroDuckVolleyVisionEnvCfg as EnvCfg
@@ -360,7 +394,7 @@ def collect(args: argparse.Namespace) -> dict:
     from isaaclab_tasks.contrib.microduck.volley_task_settings import apply_task_settings, resolve_task_settings
 
     cfg = EnvCfg()
-    apply_task_settings(cfg, resolve_task_settings(metadata))
+    apply_task_settings(cfg, resolve_task_settings(metadata, live_pass=profile == LIVE_PASS_PROFILE))
     cfg.scene.num_envs = args.num_envs
     cfg.sim.visualizer_cfgs = []
     cfg.seed = args.seed
@@ -373,7 +407,9 @@ def collect(args: argparse.Namespace) -> dict:
         sim_utils.create_new_stage()
         env = Environment(cfg)
         try:
-            if profile == VISION_PROFILE and "vision_contract" in metadata:
+            if profile == LIVE_PASS_PROFILE:
+                env.validate_source_contract(metadata)
+            elif profile == VISION_PROFILE and "vision_contract" in metadata:
                 if metadata["vision_contract"] != env.vision_contract():
                     raise ValueError("Saved visual observation/camera contract differs from this environment.")
             env.set_evaluation(True, seed=args.seed)
